@@ -1,0 +1,30 @@
+{
+  "name": "edgepulse",
+  "version": "8.0.0",
+  "description": "Enterprise-grade Cloudflare Worker Telegram AI Agent with OpenCode & Cherry Studio Multi-Provider Engine",
+  "main": "worker.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "telegram-bot",
+    "ai-agent",
+    "opencode",
+    "cherry-studio",
+    "chatbox",
+    "llm",
+    "gemini",
+    "groq",
+    "openrouter",
+    "deepseek"
+  ],
+  "author": "EdgePulse Team",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
