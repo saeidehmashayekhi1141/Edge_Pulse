@@ -20,9 +20,10 @@
     "gemini",
     "groq",
     "openrouter",
-    "deepseek"
+    "deepseek",
+    "cynet"
   ],
-  "author": "EdgePulse Team",
+  "author": "Hassan & CyNet Security Team (cynetx.ir)",
   "license": "MIT",
   "devDependencies": {
     "wrangler": "^3.80.0"
