@@ -124,7 +124,7 @@
 * 👥 **گروه دورهمی، پرسش و پاسخ:** [@cynetgap](https://t.me/cynetgap)
 * 🌐 **وب‌سایت رسمی ساینت:** [cynetx.ir](https://cynetx.ir)
 * 💬 **انجمن تخصصی:** [forum.cynetx.ir](https://forum.cynetx.ir)
-* 👨‍💻 **ارتباط با حسان:** [@H_a33_an](https://t.me/H_a33_an)
+* 👨‍💻 **ارتباط با حسن:** [@H_a33_an](https://t.me/H_a33_an)
 
 ---
 

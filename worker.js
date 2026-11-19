@@ -4,13 +4,13 @@ function escapeHtml(str) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
+    .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
 
 // ============================================================================
 // ULTIMATE CLOUDFLARE AI AGENT (V8.0 PRO - OPENCODE & CHERRY STUDIO EDITION)
-// Features: Web Onboarding & Auto-Webhook | Multi-Provider Engine (CCR, Groq, OpenRouter, Gemini)
+// Features: Web Onboarding & Auto-Webhook | Multi-Provider Engine (Custom Provider, Groq, OpenRouter, Gemini)
 // Smart Base URL Normalization & Auto-Probe | Free Model Classifier & Live Latency Tester
 // ============================================================================
 
@@ -31,6 +31,24 @@ const CONFIG = {
 
 const ACTIVE_USER_LOCKS = new Map();
 const PROCESSED_UPDATES = new Set();
+const GLOBAL_MEMORY_STORE = new Map();
+const RATE_LIMITED_MODELS = new Map(); // modelId -> cooldownUntilTimestampMs
+
+function markModelRateLimited(modelId, durationMs = 60000) {
+  if (!modelId) return;
+  RATE_LIMITED_MODELS.set(modelId, Date.now() + durationMs);
+}
+
+function isModelRateLimited(modelId) {
+  if (!modelId) return false;
+  const exp = RATE_LIMITED_MODELS.get(modelId);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    RATE_LIMITED_MODELS.delete(modelId);
+    return false;
+  }
+  return true;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -52,7 +70,7 @@ export default {
     // صفحات وب (Setup یا Dashboard)
     if (request.method === "GET") {
       if (url.pathname === "/setup" || !botToken) {
-        return new Response(renderSetupHTML(sys, botToken, origin), {
+        return new Response(renderSetupHTML(sys, botToken, origin, Boolean(env.BOT_KV)), {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
       }
@@ -174,7 +192,7 @@ async function autoDetectAndTestBaseUrl(rawUrl, apiKey) {
     }
   }
 
-  // Phase 2: Probe POST /chat/completions (for minimal CCR proxies without /models endpoint)
+  // Phase 2: Probe POST /chat/completions (for minimal proxies without /models endpoint)
   for (const cand of candidates) {
     try {
       const controller = new AbortController();
@@ -307,7 +325,17 @@ async function testModelLatencyAndHealth(baseUrl, apiKey, modelId) {
       return { ok: true, latencyMs: latency, reply: cleanModelOutput(reply) };
     } else {
       const errBody = await res.text().catch(() => "");
-      return { ok: false, latencyMs: latency, status: res.status, error: `کد ${res.status}: ${errBody.slice(0, 160)}` };
+      const is429 = res.status === 429;
+      if (is429) {
+        markModelRateLimited(modelId, 60000);
+      }
+      return {
+        ok: false,
+        latencyMs: latency,
+        status: res.status,
+        isRateLimit: is429,
+        error: is429 ? "محدودیت نرخ (429 Rate Limit): سهمیه موقتاً پر است" : `کد ${res.status}: ${errBody.slice(0, 160)}`
+      };
     }
   } catch (e) {
     return { ok: false, latencyMs: Date.now() - start, error: e.message };
@@ -330,11 +358,16 @@ async function storageGet(env, key) {
       return data.result !== undefined && data.result !== null ? String(data.result) : null;
     } catch (e) {}
   }
-  return env.BOT_KV ? await env.BOT_KV.get(key) : null;
+  if (env.BOT_KV) {
+    const val = await env.BOT_KV.get(key);
+    if (val !== null && val !== undefined) return val;
+  }
+  return GLOBAL_MEMORY_STORE.get(key) || null;
 }
 
 async function storagePut(env, key, value, options = {}) {
   const strVal = typeof value === "string" ? value : JSON.stringify(value);
+  GLOBAL_MEMORY_STORE.set(key, strVal);
   if (env.UPSTASH_URL && env.UPSTASH_TOKEN) {
     try {
       const cmd = options.expirationTtl ? ["SET", key, strVal, "EX", options.expirationTtl] : ["SET", key, strVal];
@@ -352,6 +385,7 @@ async function storagePut(env, key, value, options = {}) {
 }
 
 async function storageDelete(env, key) {
+  GLOBAL_MEMORY_STORE.delete(key);
   if (env.UPSTASH_URL && env.UPSTASH_TOKEN) {
     try {
       await fetch(env.UPSTASH_URL, {
@@ -369,9 +403,21 @@ async function storageDelete(env, key) {
 
 function cleanModelOutput(text) {
   if (!text) return "";
-  let cleaned = text.replace(/<thought>[\s\S]*?<\/thought>/gi, "");
+  let cleaned = String(text);
+
+  // 1. حذف بلوک‌های کامل تفکر <think>...</think> و <thought>...</thought>
   cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  cleaned = cleaned.replace(/^<thought>[\s\S]*/gi, "");
+  cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, "");
+
+  // 2. اگر تگ بسته تفکر تنها مانده باشد
+  cleaned = cleaned.replace(/[\s\S]*?<\/think>/gi, "");
+  cleaned = cleaned.replace(/[\s\S]*?<\/thought>/gi, "");
+
+  // 3. اگر تگ تفکر باز شده اما هرگز بسته نشده (مدل وسط استدلال بریده شده و جوابی تولید نکرده)
+  // در این حالت متن خالی می‌شود تا سیستم پاسخ ناقص را ارسال نکرده و به مدل سالم بعدی سوئیچ کند
+  cleaned = cleaned.replace(/<think>[\s\S]*/gi, "");
+  cleaned = cleaned.replace(/<thought>[\s\S]*/gi, "");
+
   return cleaned.trim();
 }
 
@@ -483,11 +529,19 @@ async function fetchLiveModelsFromProvider(env, sys, forceRefresh = false, custo
   const activeKey = customUserConfig?.apiKey ? { key: customUserConfig.apiKey } : getOrderedKeys(sys)[0];
 
   if (!customUserConfig && !forceRefresh && sys.cachedModels && sys.cachedModels.length > 0 && sys.cachedBaseUrl === baseUrl) {
-    return {
-      models: sys.cachedModels,
-      freeModels: sys.cachedFreeModels || [],
-      error: null
-    };
+    const hasDirtyBlacklist = sys.cachedModels.some(m =>
+      /^(absolutereality|albedobase|amponyt|anything-v|bge-|sdxl|diffusion|cyberrealistic)/i.test(m)
+    );
+    if (!hasDirtyBlacklist) {
+      return {
+        models: sys.cachedModels,
+        freeModels: sys.cachedFreeModels || [],
+        error: null
+      };
+    }
+    // اگر کش حاوی مدل‌های سیاه بود، کش را نامعتبر کن تا دوباره با فیلتر استخراج شوند
+    sys.cachedModels = [];
+    sys.cachedFreeModels = [];
   }
 
   if (!activeKey) {
@@ -561,8 +615,43 @@ async function fetchLiveModelsFromProvider(env, sys, forceRefresh = false, custo
   };
 }
 
+function getModelScore(id) {
+  const m = id.toLowerCase();
+  let score = 0;
+  // Free tier bonus
+  if (m.includes(":free") || m.includes("-free") || m.includes("/free")) score += 25;
+
+  // Top modern chat LLM families
+  if (m.includes("deepseek-r1") || m.includes("deepseek-reasoner")) score += 100;
+  else if (m.includes("deepseek-chat") || m.includes("deepseek-v3") || m.includes("deepseek")) score += 95;
+  else if (m.includes("gemini-2.5") || m.includes("gemini-2.0") || m.includes("gemini-exp")) score += 92;
+  else if (m.includes("gemini-1.5-flash") || m.includes("gemini-1.5-pro")) score += 88;
+  else if (m.includes("llama-3.3") || m.includes("llama-3.2") || m.includes("llama-3.1")) score += 85;
+  else if (m.includes("qwen-2.5") || m.includes("qwq")) score += 82;
+  else if (m.includes("claude-3-7") || m.includes("claude-3-5") || m.includes("claude-3")) score += 80;
+  else if (m.includes("gpt-4o") || m.includes("o1") || m.includes("o3")) score += 78;
+  else if (m.includes("mistral") || m.includes("codestral") || m.includes("mixtral")) score += 75;
+  else if (m.includes("gemma-2") || m.includes("phi-4") || m.includes("phi-3")) score += 70;
+  else if (m.includes("llama")) score += 65;
+  else score += 10;
+
+  return score;
+}
+
 function normalizeModelList(rawList, isGoogle, baseUrl = "") {
-  const blacklist = ["embed", "tts", "whisper", "dall-e", "flux", "imagen", "veo", "aqa", "bisociate", "learnlm"];
+  const blacklist = [
+    // Embeddings
+    "embed", "bge-", "bge:", "bge/", "rerank", "sentence-transformers", "text-embedding", "cohere-embed",
+    // Image generation & vision checkpoint models
+    "sdxl", "diffusion", "stable-diffusion", "dall-e", "flux", "imagen", "veo", "midjourney",
+    "albedobase", "anything-v", "absolutereality", "amponyt", "cyberrealistic", "pony",
+    "realvis", "dreamshaper", "deliberate", "rev-animated", "epicrealism", "juggernaut",
+    "playground-v", "sd-", "svd", "animagine", "image-2.", "image-2-", "image-3.", "image-generation",
+    // Audio, Speech & TTS
+    "tts", "whisper", "voice", "speech", "audio", "music", "aura-", "aura:", "beam:",
+    // Evaluation, Moderation & Internal
+    "moderation", "guard", "reward", "aqa", "bisociate", "learnlm", "classifier"
+  ];
   const list = [];
   const seen = new Set();
 
@@ -574,7 +663,16 @@ function normalizeModelList(rawList, isGoogle, baseUrl = "") {
     }
     const cleanId = rawId.replace(/^models\//, "").trim();
     if (!cleanId || seen.has(cleanId)) continue;
-    if (blacklist.some(bad => cleanId.toLowerCase().includes(bad))) continue;
+
+    // Check OpenRouter / aggregator modality if present (reject non-text models)
+    if (item && typeof item === "object" && item.architecture && typeof item.architecture.modality === "string") {
+      const modality = item.architecture.modality.toLowerCase();
+      if (modality.includes("image") && !modality.endsWith("->text")) continue;
+      if (modality.includes("embedding")) continue;
+    }
+
+    const lowerId = cleanId.toLowerCase();
+    if (blacklist.some(bad => lowerId.includes(bad))) continue;
 
     seen.add(cleanId);
     const info = classifyModel(cleanId, baseUrl, typeof item === "object" ? item : null);
@@ -586,7 +684,114 @@ function normalizeModelList(rawList, isGoogle, baseUrl = "") {
     });
   }
 
+  // Sort models: highest quality chat models and free models first
+  list.sort((a, b) => getModelScore(b.id) - getModelScore(a.id));
+
   return list;
+}
+
+function getModelFamily(modelId) {
+  const m = (modelId || "").toLowerCase();
+  if (m.includes("deepseek")) return "deepseek";
+  if (m.includes("llama")) return "llama";
+  if (m.includes("gemini")) return "gemini";
+  if (m.includes("qwen") || m.includes("qwq")) return "qwen";
+  if (m.includes("mistral") || m.includes("codestral") || m.includes("mixtral")) return "mistral";
+  if (m.includes("claude")) return "claude";
+  if (m.includes("gpt") || m.includes("o1") || m.includes("o3") || m.includes("chatgpt")) return "openai";
+  if (m.includes("gemma")) return "gemma";
+  if (m.includes("glm") || m.includes("chatglm")) return "glm";
+  if (m.includes("phi")) return "phi";
+  return "other";
+}
+
+function buildDiverseModelQueue(preferredModel, liveModels, freeModels = []) {
+  const isAutoFree = preferredModel === "auto_free";
+  const isAutoAll = preferredModel === "auto" || !preferredModel;
+  const isExplicit = !isAutoFree && !isAutoAll;
+
+  // انتخاب مخزن مدل‌ها بر اساس حالت انتخابی
+  let basePool = [];
+  if (isAutoFree) {
+    basePool = (Array.isArray(freeModels) && freeModels.length > 0)
+      ? [...freeModels]
+      : (liveModels || []).filter(m => m.includes(":free") || m.includes("-free") || m.includes("/free"));
+    if (basePool.length === 0) basePool = [...(liveModels || [])];
+  } else if (isExplicit) {
+    basePool = [preferredModel];
+    const candidateFallbacks = (Array.isArray(freeModels) && freeModels.length > 0) ? freeModels : (liveModels || []);
+    for (const m of candidateFallbacks) {
+      if (!basePool.includes(m)) basePool.push(m);
+    }
+    for (const m of (liveModels || [])) {
+      if (!basePool.includes(m)) basePool.push(m);
+    }
+  } else {
+    basePool = [...(liveModels || [])];
+  }
+
+  // حذف موارد تکراری با حفظ تقدم اولیه
+  const pool = Array.from(new Set(basePool));
+
+  // جداسازی مدل‌های در حال استراحت (429 Rate Limited Cooldown) از مدل‌های آماده
+  const healthy = [];
+  const coolingDown = [];
+  for (const m of pool) {
+    if (isModelRateLimited(m)) {
+      coolingDown.push(m);
+    } else {
+      healthy.push(m);
+    }
+  }
+
+  // دسته‌بندی مدل‌های سالم بر اساس خانواده ارائه‌دهنده (Provider Family Bucketing)
+  const familyOrder = ["deepseek", "llama", "gemini", "qwen", "mistral", "claude", "openai", "gemma", "glm", "phi", "other"];
+  const buckets = {};
+  for (const fam of familyOrder) buckets[fam] = [];
+
+  for (const m of healthy) {
+    const fam = getModelFamily(m);
+    if (!buckets[fam]) buckets[fam] = [];
+    buckets[fam].push(m);
+  }
+
+  const queue = [];
+  let prefFam = null;
+
+  // اگر مدل مشخصی انتخاب شده باشد، دقیقاً در رتبه اول قرار می‌گیرد
+  if (isExplicit) {
+    queue.push(preferredModel);
+    prefFam = getModelFamily(preferredModel);
+    if (buckets[prefFam]) {
+      buckets[prefFam] = buckets[prefFam].filter(m => m !== preferredModel);
+    }
+  }
+
+  // در صورت انتخاب مدل دستی، گردش خانواده‌ها از خانواده بعدی آغاز می‌شود تا در صورت بروز ۴۲۹ فوراً به شرکتی دیگر سوئیچ شود
+  let activeFamilyOrder = familyOrder;
+  if (prefFam && familyOrder.includes(prefFam)) {
+    const idx = familyOrder.indexOf(prefFam);
+    activeFamilyOrder = familyOrder.slice(idx + 1).concat(familyOrder.slice(0, idx + 1));
+  }
+
+  // تنیدن خانواده‌ها به صورت نوبتی (Interleaving across distinct model families)
+  let remaining = true;
+  while (remaining) {
+    remaining = false;
+    for (const fam of activeFamilyOrder) {
+      if (buckets[fam] && buckets[fam].length > 0) {
+        queue.push(buckets[fam].shift());
+        remaining = true;
+      }
+    }
+  }
+
+  // اضافه کردن مدل‌های دارای لیمیت در انتهای صف برای موارد اضطراری
+  for (const m of coolingDown) {
+    if (!queue.includes(m)) queue.push(m);
+  }
+
+  return queue;
 }
 
 function getOrderedKeys(sys) {
@@ -652,6 +857,15 @@ async function getSystemState(env) {
     if (!parsed.stats) parsed.stats = { totalUsers: {}, totalRequests: 0 };
     if (!parsed.sponsorChannels) parsed.sponsorChannels = [];
     if (!parsed.photoGallery) parsed.photoGallery = [];
+    if (parsed.publicMode === undefined) parsed.publicMode = true;
+    if (parsed.sponsorLock === undefined) parsed.sponsorLock = (parsed.sponsorChannels.length > 0);
+    if (parsed.providers && Array.isArray(parsed.providers)) {
+      parsed.providers.forEach(p => {
+        if (p.name && (p.name.includes("CCR") || p.name.includes("ccr"))) {
+          p.name = p.name.replace(/CCR/gi, "Custom Provider").replace(/سرور اختصاصی Custom Provider/, "ارائه‌دهنده اختصاصی (Custom Provider)").trim();
+        }
+      });
+    }
     return parsed;
   }
 
@@ -667,7 +881,7 @@ async function getSystemState(env) {
     workSoul: CONFIG.DEFAULT_WORK_SOUL,
     customSoul: CONFIG.DEFAULT_CUSTOM_SOUL,
     soul: CONFIG.DEFAULT_GUEST_SOUL,
-    selectedModel: "auto",
+    selectedModel: "auto_free",
     activeKeyIndex: 0,
     apiKeys: [],
     providers: [
@@ -708,7 +922,7 @@ async function getSystemState(env) {
     crons: [],
     photoGallery: [],
     sponsorChannels: [],
-    publicMode: false,
+    publicMode: true,
     defaultDailyLimit: 20,
     stats: { totalUsers: {}, totalRequests: 0 },
     linuxBridgeUrl: "",
@@ -719,15 +933,488 @@ async function getSystemState(env) {
 }
 
 // ============================================================================
-// منوی مدل‌ها در تلگرام با تفکیک مدل‌های رایگان (sendModelMenu)
+// صفحه شروع اصلی خلوت و مدرن (sendStartMenu) برای ادمین و کلاینت‌ها
 // ============================================================================
-async function sendModelMenu(botToken, chatId, env, sys, forceRefresh = true, customUserConfig = null, isAdmin = true, filterType = "all") {
+// ============================================================================
+// ارسال یا ویرایش هوشمند درجا پیام تلگرام جهت جلوگیری از اسپم (editOrSendMessage)
+// ============================================================================
+async function editOrSendMessage(botToken, chatId, text, buttons = [], messageIdToEdit = null) {
+  if (messageIdToEdit) {
+    try {
+      const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageIdToEdit,
+          text: text,
+          parse_mode: "Markdown",
+          reply_markup: buttons && buttons.length > 0 ? { inline_keyboard: buttons } : undefined
+        })
+      });
+      const data = await editRes.json();
+      if (data.ok) return data;
+    } catch (e) {}
+  }
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+async function sendStartMenu(botToken, chatId, env, sys, isAdmin, firstName, workerOrigin, messageIdToEdit = null) {
+  if (isAdmin) {
+    const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0] || { name: "پیش‌فرض" };
+    let modelDisplay = sys.selectedModel || "auto_free";
+    if (modelDisplay === "auto_free") modelDisplay = "🎁 خودکار (فقط رایگان‌ها)";
+    else if (modelDisplay === "auto") modelDisplay = "💎 خودکار (تمام مدل‌ها)";
+
+    const isSponsorOn = sys.sponsorLock !== false && (sys.sponsorChannels || []).length > 0;
+    const isPublicOn = sys.publicMode !== false;
+    const origin = workerOrigin || sys.workerOrigin || "";
+
+    const welcomeText = `سلام مدیر گرامی! دستیار هوشمند آماده است. 🤖\n\n` +
+      `🌐 **سرور فعال:** **${activeProv.name}**\n` +
+      `🤖 **مدل فعال:** \`${modelDisplay}\`\n` +
+      `📢 **قفل جوین اجباری:** ${isSponsorOn ? "🟢 فعال" : "⚪ غیرفعال"}\n` +
+      `🌍 **دسترسی عمومی (کلاینت‌ها):** ${isPublicOn ? "🟢 آزاد برای همه" : "🔒 فقط مدیر"}\n\n` +
+      `💡 *هر پیام، سوال، کد یا فایلی بفرستید هوش مصنوعی پاسخ می‌دهد. برای مدیریت از گزینه‌های زیر استفاده کنید:*`;
+
+    const buttons = [];
+    if (origin) {
+      buttons.push([{ text: "🎛 پنل وب و مینی‌اپ", web_app: { url: `${origin}/app` } }]);
+    }
+    buttons.push([
+      { text: "🌐 سرورها", callback_data: "menu_providers" },
+      { text: "🤖 مدل‌ها", callback_data: "menu_models" },
+      { text: "📊 وضعیت", callback_data: "menu_status" }
+    ]);
+    buttons.push([
+      { text: "📢 قفل جوین اجباری", callback_data: "menu_sponsor" },
+      { text: isPublicOn ? "🌍 دسترسی: عمومی 🟢" : "🔒 دسترسی: فقط ادمین", callback_data: "toggle_public_mode" }
+    ]);
+    buttons.push([
+      { text: "➕ گفتگوی جدید", callback_data: "new_chat" },
+      { text: "📜 تاریخچه", callback_data: "history_menu" }
+    ]);
+
+    if (messageIdToEdit) {
+      const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageIdToEdit,
+          text: welcomeText,
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: buttons }
+        })
+      }).then(r => r.json()).catch(() => null);
+      if (editRes && editRes.ok) return;
+    }
+    return sendTelegramMessage(botToken, chatId, welcomeText, buttons);
+  } else {
+    // برای کلاینت‌ها / عموم کاربران: خلوت، صمیمی و بدون دکمه‌های سردرگم‌کننده
+    const clientText = `👋 سلام ${firstName || "کاربر"} عزیز! به دستیار هوش مصنوعی خوش آمدید.\n\n` +
+      `من آماده‌ام تا به سوالات شما پاسخ دهم، متن‌ها و مقالات بنویسم، کدهای برنامه‌نویسی را تحلیل کنم و در کارهای روزمره کمکتان کنم.\n\n` +
+      `💬 **کافیست هر سوال یا درخواستی دارید همینجا تایپ و ارسال کنید!**`;
+
+    const clientButtons = [
+      [
+        { text: "➕ شروع گفتگوی جدید", callback_data: "new_chat" },
+        { text: "📜 تاریخچه چت‌های من", callback_data: "history_menu" }
+      ]
+    ];
+
+    if (messageIdToEdit) {
+      const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageIdToEdit,
+          text: clientText,
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: clientButtons }
+        })
+      }).then(r => r.json()).catch(() => null);
+      if (editRes && editRes.ok) return;
+    }
+    return sendTelegramMessage(botToken, chatId, clientText, clientButtons);
+  }
+}
+
+// ============================================================================
+// مدیریت قفل جوین اجباری (sendSponsorMenu)
+// ============================================================================
+async function sendSponsorMenu(botToken, chatId, sys, messageIdToEdit = null) {
+  const channels = sys.sponsorChannels || [];
+  const isLockActive = sys.sponsorLock !== false && channels.length > 0;
+
+  let text = `📢 **مدیریت قفل جوین اجباری کانال (Sponsor Channels):**\n\n` +
+    `🔒 **وضعیت قفل جوین:** ${isLockActive ? "🟢 فعال (کاربران عادی ملزم به عضویت)" : "⚪ غیرفعال (استفاده آزاد بدون قفل)"}\n` +
+    `👥 **تعداد کانال‌های ثبت‌شده:** **${channels.length}** کانال\n\n` +
+    `📋 **لیست کانال‌های فعلی:**\n` +
+    (channels.length > 0 ? channels.map((c, i) => `  ${i + 1}. \`${c}\``).join("\n") : "  _هنوز هیچ کانالی ثبت نشده است._") + `\n\n` +
+    `💡 **نکته بسیار مهم:** حتماً ربات را در کانال(های) خود به عنوان **مدیر (Admin)** با دسترسی مشاهده اعضا اضافه کنید تا بتواند عضویت کاربران را بررسی نماید.`;
+
+  const buttons = [
+    [
+      {
+        text: sys.sponsorLock ? "🔴 غیرفعال‌سازی قفل جوین" : "🟢 فعال‌سازی قفل جوین",
+        callback_data: "toggle_sponsor_lock"
+      }
+    ],
+    [
+      { text: "➕ افزودن کانال جدید", callback_data: "wz_add_channel" }
+    ]
+  ];
+
+  if (channels.length > 0) {
+    const delButtons = channels.map((c, idx) => ({
+      text: `🗑 حذف ${c}`,
+      callback_data: `del_channel:${idx}`
+    }));
+    for (let i = 0; i < delButtons.length; i += 2) {
+      buttons.push(delButtons.slice(i, i + 2));
+    }
+  }
+
+  buttons.push([
+    { text: "🔙 بازگشت به منوی اصلی", callback_data: "menu_start" }
+  ]);
+
+  if (messageIdToEdit) {
+    const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      })
+    }).then(r => r.json()).catch(() => null);
+    if (editRes && editRes.ok) return;
+  }
+
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+// ============================================================================
+// منوی مدیریت ارائه‌دهنده‌ها و ویزارد تعاملی قدم‌به‌قدم تلگرام (Interactive Wizard)
+// ============================================================================
+async function sendProvidersMenu(botToken, chatId, sys, messageIdToEdit = null) {
+  const provs = sys.providers || [];
+  const activeProv = provs.find(p => p.isDefault) || provs[0];
+
+  const buttons = provs.map(p => [{
+    text: `${p.isDefault ? "🟢 " : "⚪ "}${p.name} (${p.baseUrl.replace(/^https?:\/\//, "").split("/")[0]})`,
+    callback_data: `view_prov:${p.id}`
+  }]);
+
+  buttons.push([
+    { text: "➕ افزودن سرور جدید (مرحله به مرحله)", callback_data: "wz_start_prov" }
+  ]);
+  buttons.push([
+    { text: "🔄 واکشی مجدد مدل‌ها از API", callback_data: "refresh_models" }
+  ]);
+  buttons.push([
+    { text: "🔙 بازگشت به منوی اصلی", callback_data: "menu_start" }
+  ]);
+
+  const text = `🌐 **مدیریت ارائه‌دهنده‌ها (AI Providers):**\n\n` +
+    `📌 **سرور فعال ربات:** **${activeProv?.name || "پیش‌فرض"}**\n` +
+    `🔗 **آدرس:** \`${activeProv?.baseUrl || "ثبت نشده"}\`\n` +
+    `🔑 **کلید:** ${activeProv?.apiKey ? "✅ ثبت شده (" + activeProv.apiKey.slice(0, 5) + "...)" : "🔓 بدون کلید / عمومی"}\n\n` +
+    `برای مشاهده جزئیات، تست پینگ یا سوییچ سرور روی هر گزینه بزنید، یا با دکمه **«➕ افزودن سرور جدید»** سرور دلخواهتان را متصل کنید:`;
+
+  if (messageIdToEdit) {
+    const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      })
+    }).then(r => r.json()).catch(() => null);
+    if (editRes && editRes.ok) return;
+  }
+
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+async function sendProviderDetailCard(botToken, chatId, p, isDefault, totalProvs, messageIdToEdit = null) {
+  const buttons = [];
+  if (!isDefault) {
+    buttons.push([{ text: "⭐ فعال‌سازی و سوییچ به این سرور", callback_data: `set_provider:${p.id}` }]);
+  }
+  buttons.push([
+    { text: "⚡ تست پینگ این سرور", callback_data: `test_prov_ping:${p.id}` },
+    { text: "🤖 مشاهده مدل‌های این سرور", callback_data: `view_prov_models:${p.id}` }
+  ]);
+  if (totalProvs > 1) {
+    buttons.push([{ text: "🗑 حذف این سرور", callback_data: `del_prov:${p.id}` }]);
+  }
+  buttons.push([{ text: "🔙 بازگشت به لیست سرورها", callback_data: "menu_providers" }]);
+
+  const text = `🌐 **اطلاعات و تنظیمات سرور هوش مصنوعی:**\n\n` +
+    `📌 **نام:** **${p.name}**\n` +
+    `🔗 **آدرس Base URL:** \`${p.baseUrl}\`\n` +
+    `🔑 **کلید API:** ${p.apiKey ? "✅ ثبت شده (" + p.apiKey.slice(0, 5) + "...)" : "🔓 بدون کلید"}\n` +
+    `📡 **وضعیت فعالیت:** ${isDefault ? "🟢 فعال (پیش‌فرض ربات)" : "⚪ غیرفعال"}\n\n` +
+    `عملیات مورد نظر خود را انتخاب کنید:`;
+
+  return editOrSendMessage(botToken, chatId, text, buttons, messageIdToEdit);
+}
+
+async function sendModelDetailCard(botToken, chatId, m, sys, isFree, messageIdToEdit = null) {
+  const isSelected = sys.selectedModel === m;
+  const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0];
+  const buttons = [
+    [
+      { text: isSelected ? "✅ در حال حاضر فعال است" : "⭐ انتخاب و فعال‌سازی این مدل روی ربات", callback_data: `apply_model:${m}` }
+    ],
+    [
+      { text: "🧪 تست زنده پینگ و سرعت (Latency)", callback_data: `test_model_tg:${m}` }
+    ],
+    [
+      { text: "🔙 بازگشت به لیست مدل‌ها", callback_data: "menu_models" }
+    ]
+  ];
+
+  const text = `🤖 **اطلاعات و تست اختصاصی مدل:**\n\n` +
+    `📌 **شناسه مدل:** \`${m}\`\n` +
+    `🏷 **وضعیت هزینه:** ${isFree ? "🟢 کاملاً رایگان (Free Tier 🎁)" : "💎 استاندارد"}\n` +
+    `🌐 **سرور متصل:** ${activeProv?.name || "پیش‌فرض"}\n` +
+    `📡 **وضعیت در ربات:** ${isSelected ? "🟢 مدل کنونی فعال" : "⚪ آماده انتخاب"}\n\n` +
+    `می‌توانید با دکمه زیر تاخیر میلی‌ثانیه‌ای و سلامت این مدل را قبل از فعال‌سازی تست کنید:`;
+
+  return editOrSendMessage(botToken, chatId, text, buttons, messageIdToEdit);
+}
+
+async function sendWizardStep1(botToken, chatId) {
+  const text = `✨ **افزودن ارائه‌دهنده جدید هوش مصنوعی (گام ۱ از ۳)**\n\n` +
+    `لطفاً **نام سرور یا ارائه‌دهنده** را بفرستید.\n` +
+    `*(می‌توانید از گزینه‌های آماده زیر بزنید یا نام دلخواه تایپ فرمایید)*:`;
+
+  const buttons = [
+    [
+      { text: "⚡ Groq Cloud", callback_data: "wz_name:Groq Cloud" },
+      { text: "🔮 OpenRouter", callback_data: "wz_name:OpenRouter" }
+    ],
+    [
+      { text: "💎 Google Gemini", callback_data: "wz_name:Google Gemini" },
+      { text: "🤖 DeepSeek Official", callback_data: "wz_name:DeepSeek" }
+    ],
+    [
+      { text: "🌐 ارائه‌دهنده اختصاصی (Custom Provider)", callback_data: "wz_name:Custom Provider" }
+    ],
+    [
+      { text: "❌ انصراف", callback_data: "wz_cancel" }
+    ]
+  ];
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+async function sendWizardStep2(botToken, chatId, name) {
+  const text = `🔗 **تنظیم آدرس سرور (Base URL) — (گام ۲ از ۳)**\n\n` +
+    `📌 **نام انتخاب‌شده:** **${name}**\n\n` +
+    `اکنون **آدرس پایه API (Base URL)** را وارد کنید یا از دکمه پیشنهادی زیر بزنید.\n` +
+    `*(نگران اسلش‌های اضافی یا v1/ نباشید؛ سیستم هوشمند خودکار آن را نرمال‌سازی می‌کند)*:`;
+
+  const buttons = [];
+  const lower = (name || "").toLowerCase();
+  if (lower.includes("groq")) {
+    buttons.push([{ text: "🔗 https://api.groq.com/openai/v1", callback_data: "wz_url:https://api.groq.com/openai/v1" }]);
+  } else if (lower.includes("openrouter")) {
+    buttons.push([{ text: "🔗 https://openrouter.ai/api/v1", callback_data: "wz_url:https://openrouter.ai/api/v1" }]);
+  } else if (lower.includes("gemini") || lower.includes("google")) {
+    buttons.push([{ text: "🔗 https://generativelanguage.googleapis.com/v1beta/openai", callback_data: "wz_url:https://generativelanguage.googleapis.com/v1beta/openai" }]);
+  } else if (lower.includes("deepseek")) {
+    buttons.push([{ text: "🔗 https://api.deepseek.com/v1", callback_data: "wz_url:https://api.deepseek.com/v1" }]);
+  }
+  buttons.push([{ text: "❌ انصراف", callback_data: "wz_cancel" }]);
+
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+async function sendWizardStep3(botToken, chatId, name, baseUrl) {
+  const text = `🔑 **تنظیم کلید API (گام ۳ از ۳)**\n\n` +
+    `📌 **نام سرور:** **${name}**\n` +
+    `🌐 **آدرس:** \`${baseUrl}\`\n\n` +
+    `اکنون **کلید API (API Key)** خود را تایپ و ارسال فرمایید:\n` +
+    `*(اگر سرور یا پروکسی اختصاصی شما بدون کلید کار می‌کند، دکمه «بدون کلید» را بزنید)*`;
+
+  const buttons = [
+    [{ text: "🔓 بدون کلید (پروکسی عمومی / سرور محلی)", callback_data: "wz_key_none" }],
+    [{ text: "❌ انصراف", callback_data: "wz_cancel" }]
+  ];
+  return sendTelegramMessage(botToken, chatId, text, buttons);
+}
+
+async function finishProviderWizard(env, sys, botToken, chatId, name, rawUrl, key) {
+  const normUrl = smartNormalizeBaseUrl(rawUrl);
+  const newProv = {
+    id: `prov_${Date.now()}`,
+    name: name || "ارائه‌دهنده اختصاصی",
+    baseUrl: normUrl,
+    apiKey: key ? key.trim() : "",
+    enabled: true,
+    isDefault: true
+  };
+
+  sys.providers = sys.providers || [];
+  sys.providers.forEach(p => p.isDefault = false);
+  sys.providers.push(newProv);
+  sys.baseUrl = normUrl;
+
+  if (key && key.trim()) {
+    sys.apiKeys = sys.apiKeys || [];
+    sys.apiKeys.unshift({ key: key.trim(), status: "active", label: name });
+    sys.activeKeyIndex = 0;
+  }
+
+  sys.cachedModels = [];
+  sys.cachedFreeModels = [];
+  await storagePut(env, "SYS_STATE", sys);
+
+  await sendTelegramMessage(botToken, chatId, `⏳ **سرور «${name}» ذخیره شد.**\nدر حال تست اتصال و واکشی خودکار لیست مدل‌ها از ارائه‌دهنده...`);
+
+  const discovery = await fetchLiveModelsFromProvider(env, sys, true);
+  const freeCount = discovery.freeModels?.length || 0;
+  const totalCount = discovery.models?.length || 0;
+
+  if (totalCount > 0) {
+    const text = `🎉 **ارائه‌دهنده جدید با موفقیت متصل و فعال شد!**\n\n` +
+      `🌐 **نام سرور:** **${name}**\n` +
+      `🔗 **آدرس:** \`${normUrl}\`\n` +
+      `🔑 **وضعیت کلید:** ${key ? "ثبت شد" : "بدون کلید"}\n` +
+      `🤖 **کل مدل‌های دریافت شده:** **${totalCount}** عدد\n` +
+      `🎁 **مدل‌های کاملاً رایگان:** **${freeCount}** عدد\n\n` +
+      `هم‌اکنون می‌توانید مدل‌ها را مشاهده، تست یا انتخاب نمایید:`;
+
+    const buttons = [
+      [
+        { text: `🎁 مشاهده مدل‌های رایگان (${freeCount})`, callback_data: "filter_models:free" },
+        { text: `💎 همه مدل‌ها (${totalCount})`, callback_data: "filter_models:all" }
+      ],
+      [
+        { text: "⚡ تست پینگ این سرور", callback_data: `test_prov_ping:${newProv.id}` },
+        { text: "🌐 لیست همه سرورها", callback_data: "menu_providers" }
+      ]
+    ];
+    return sendTelegramMessage(botToken, chatId, text, buttons);
+  } else {
+    const text = `⚠️ **سرور با موفقیت ذخیره شد اما دریافت مدل‌ها با خطا مواجه شد:**\n\n` +
+      `🌐 **سرور:** **${name}**\n` +
+      `🔗 **آدرس:** \`${normUrl}\`\n` +
+      `⚠️ **خطای دریافت:** ${discovery.error || "بدون مدل"}\n\n` +
+      `پیشنهاد می‌شود پینگ سرور یا صحت کلید API را بررسی فرمایید:`;
+
+    const buttons = [
+      [{ text: "⚡ تست پینگ این سرور", callback_data: `test_prov_ping:${newProv.id}` }],
+      [{ text: "🌐 لیست سرورها", callback_data: "menu_providers" }]
+    ];
+    return sendTelegramMessage(botToken, chatId, text, buttons);
+  }
+}
+
+// ============================================================================
+// گزارش شفاف وضعیت سرور، مدل و سلامت سیستم (sendStatusCard)
+// ============================================================================
+async function sendStatusCard(botToken, chatId, env, sys, isAdmin, messageIdToEdit = null) {
+  const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0] || {
+    id: "current",
+    name: "پیش‌فرض سیستم",
+    baseUrl: sys.baseUrl || CONFIG.DEFAULT_BASE_URL
+  };
+  const effectiveUrl = smartNormalizeBaseUrl(activeProv.baseUrl || sys.baseUrl || CONFIG.DEFAULT_BASE_URL);
+  const provHost = effectiveUrl.replace(/^https?:\/\//, "").split("/")[0];
+  const keys = getOrderedKeys(sys);
+  const activeKey = keys[0];
+  const maskedKey = activeKey?.key ? `${activeKey.key.slice(0, 8)}••••${activeKey.key.slice(-4)}` : "❌ کلید ثبت نشده";
+
+  const discovery = await fetchLiveModelsFromProvider(env, sys, false);
+  const totalModels = discovery.models.length;
+  const freeModels = (discovery.freeModels || []).length;
+
+  let modelDisplay = sys.selectedModel || "auto_free";
+  if (modelDisplay === "auto_free") {
+    const queue = buildDiverseModelQueue("auto_free", discovery.models, discovery.freeModels);
+    const firstFree = queue[0] || (discovery.freeModels && discovery.freeModels[0]) || discovery.models[0] || CONFIG.FALLBACK_MODELS[0];
+    modelDisplay = `🎁 خودکار (فقط مدل‌های رایگان) 👈 اولویت فعلی: \`${firstFree}\``;
+  } else if (modelDisplay === "auto") {
+    const queue = buildDiverseModelQueue("auto", discovery.models, discovery.freeModels);
+    const firstModel = queue[0] || discovery.models[0] || CONFIG.FALLBACK_MODELS[0];
+    modelDisplay = `💎 خودکار (تمام مدل‌ها) 👈 اولویت فعلی: \`${firstModel}\``;
+  } else {
+    modelDisplay = `\`${modelDisplay}\``;
+  }
+
+  const modeDisplay = {
+    chat: "💡 چت ساده و روزمره (/chat)",
+    work: "💼 کارمند و برنامه‌نویس (/work)",
+    custom: "🎭 شخصیت سفارشی (/custom)"
+  }[sys.defaultMode || "chat"] || "💡 چت ساده";
+
+  const statusText = `📊 **گزارش وضعیت زنده دستیار هوش مصنوعی EdgePulse:**\n\n` +
+    `🌐 **ارائه‌دهنده فعال:** **${activeProv.name}**\n` +
+    `🔗 **آدرس سرور:** \`${effectiveUrl}\`\n` +
+    `🤖 **مدل فعال ربات:** ${modelDisplay}\n` +
+    `🔑 **کلید API:** \`${maskedKey}\`\n` +
+    `📊 **تعداد مدل‌های در دسترس:** **${totalModels}** مدل (🎁 **${freeModels}** مدل رایگان)\n` +
+    `🎭 **حالت کنونی دستیار:** ${modeDisplay}\n` +
+    `👑 **سطح دسترسی شما:** ${isAdmin ? "مدیر کل (Admin)" : "کاربر عادی"}\n\n` +
+    `💡 برای تغییر سرور فعال از «🌐 سرورها» و برای تغییر مدل از «🤖 مدل‌ها» استفاده کنید.`;
+
+  const buttons = [
+    [{ text: "⚡ تست زنده پینگ و سلامت سرور", callback_data: `test_prov_ping:${activeProv.id || "current"}` }],
+    [{ text: "🧪 تست دسته‌جمعی پینگ رایگان‌ها 🎁 (ضد ۴۲۹)", callback_data: "batch_test:free:0" }],
+    [{ text: "🤖 انتخاب مدل (/model)", callback_data: "menu_models" }, { text: "🌐 سرورها (/providers)", callback_data: "menu_providers" }],
+    [{ text: "🔄 بروزرسانی وضعیت", callback_data: "menu_status" }]
+  ];
+
+  if (messageIdToEdit) {
+    const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text: statusText,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      })
+    }).then(r => r.json()).catch(() => null);
+    if (editRes && editRes.ok) return;
+  }
+
+  return sendTelegramMessage(botToken, chatId, statusText, buttons);
+}
+
+// ============================================================================
+// منوی مدل‌ها در تلگرام با صفحه‌بندی کامل و تفکیک مدل‌های رایگان (sendModelMenu)
+// ============================================================================
+async function sendModelMenu(
+  botToken,
+  chatId,
+  env,
+  sys,
+  forceRefresh = true,
+  customUserConfig = null,
+  isAdmin = true,
+  filterType = "all",
+  page = 0,
+  messageIdToEdit = null
+) {
   const discovery = await fetchLiveModelsFromProvider(env, sys, forceRefresh, customUserConfig);
   const effectiveUrl = smartNormalizeBaseUrl(customUserConfig?.baseUrl || sys.baseUrl || CONFIG.DEFAULT_BASE_URL);
   const providerHost = effectiveUrl.replace(/^https?:\/\//, "").split("/")[0];
 
   if (discovery.models.length === 0) {
-    const buttons = [[{ text: "🔄 تلاش مجدد برای دریافت از API", callback_data: "refresh_models" }]];
+    const buttons = [[{ text: "🔄 تلاش مجدد برای دریافت از API", callback_data: "refresh_models:all:0" }]];
     return sendTelegramMessage(
       botToken,
       chatId,
@@ -736,7 +1423,7 @@ async function sendModelMenu(botToken, chatId, env, sys, forceRefresh = true, cu
     );
   }
 
-  const currentSelected = !isAdmin && customUserConfig?.model ? customUserConfig.model : sys.selectedModel;
+  const currentSelected = !isAdmin && customUserConfig?.model ? customUserConfig.model : (sys.selectedModel || "auto_free");
   const freeModels = discovery.freeModels || [];
 
   let modelsToShow = discovery.models;
@@ -744,46 +1431,243 @@ async function sendModelMenu(botToken, chatId, env, sys, forceRefresh = true, cu
     modelsToShow = freeModels.length > 0 ? freeModels : discovery.models;
   }
 
-  const allModels = ["auto", ...modelsToShow.slice(0, 24)];
-  const uniqueModels = [...new Set(allModels)];
+  const pageSize = 10;
+  const totalCount = modelsToShow.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const pageSlice = modelsToShow.slice(safePage * pageSize, (safePage + 1) * pageSize);
 
   const buttons = [];
+  // Tab 1: Filters
   buttons.push([
-    { text: `🎁 فقط مدل‌های رایگان (${freeModels.length})`, callback_data: "filter_models:free" },
-    { text: `💎 همه مدل‌ها (${discovery.models.length})`, callback_data: "filter_models:all" }
+    { text: `${filterType === "free" ? "🔘 " : ""}🎁 فقط رایگان (${freeModels.length})`, callback_data: "filter_models:free:0" },
+    { text: `${filterType === "all" ? "🔘 " : ""}💎 همه (${discovery.models.length})`, callback_data: "filter_models:all:0" }
   ]);
 
-  for (let i = 0; i < uniqueModels.length; i += 2) {
+  // If page == 0, show Auto buttons (Auto Free and Auto All)
+  if (safePage === 0) {
+    buttons.push([
+      {
+        text: `${currentSelected === "auto_free" ? "🟢 " : ""}🎁 خودکار هوشمند (فقط مدل‌های رایگان)`,
+        callback_data: "apply_model:auto_free"
+      }
+    ]);
+    buttons.push([
+      {
+        text: `${currentSelected === "auto" ? "🟢 " : ""}💎 خودکار (تمام مدل‌ها)`,
+        callback_data: "apply_model:auto"
+      }
+    ]);
+  }
+
+  // Model buttons (2 per row)
+  for (let i = 0; i < pageSlice.length; i += 2) {
     const row = [];
-    for (let j = i; j < i + 2 && j < uniqueModels.length; j++) {
-      const m = uniqueModels[j];
+    for (let j = i; j < i + 2 && j < pageSlice.length; j++) {
+      const m = pageSlice[j];
       const isFree = freeModels.includes(m);
       const isSel = currentSelected === m;
+      const label = m.length > 28 ? m.slice(0, 26) + "…" : m;
       row.push({
-        text: `${isSel ? "🟢 " : ""}${isFree ? "🎁 " : ""}${m === "auto" ? "خودکار (Auto)" : m}`,
-        callback_data: `set_model:${m}`
+        text: `${isSel ? "🟢 " : ""}${isFree ? "🎁 " : ""}${label}`,
+        callback_data: `pick_model:${m}`
       });
     }
     buttons.push(row);
   }
-  buttons.push([{ text: "🔄 بروزرسانی مجدد لیست از API", callback_data: "refresh_models" }]);
 
-  const filterText = filterType === "free" ? "فقط مدل‌های رایگان 🎁" : "همه مدل‌ها";
-  await sendTelegramMessage(
-    botToken,
-    chatId,
-    `🤖 **مدل‌های فعال \`${providerHost}\` (${filterText}):**\n⭐ مدل انتخابی: \`${currentSelected}\`\n🎁 مدل‌های رایگان با نشان هدیه مشخص شده‌اند.`,
-    buttons
-  );
+  // Navigation row
+  const navRow = [];
+  if (safePage > 0) {
+    navRow.push({ text: "◀️ قبلی", callback_data: `page_models:${filterType}:${safePage - 1}` });
+  } else {
+    navRow.push({ text: "⏹️ اول", callback_data: "noop" });
+  }
+  navRow.push({ text: `📄 ${safePage + 1} از ${totalPages}`, callback_data: "noop" });
+  if (safePage < totalPages - 1) {
+    navRow.push({ text: "بعدی ▶️", callback_data: `page_models:${filterType}:${safePage + 1}` });
+  } else {
+    navRow.push({ text: "⏹️ آخر", callback_data: "noop" });
+  }
+  buttons.push(navRow);
+
+  // Bottom action row
+  buttons.push([
+    { text: "🧪 تست دسته‌جمعی پینگ رایگان‌ها 🎁 (ضد ۴۲۹)", callback_data: "batch_test:free:0" }
+  ]);
+  buttons.push([
+    { text: "🔄 بروزرسانی از API", callback_data: `refresh_models:${filterType}:${safePage}` },
+    { text: "📊 وضعیت سیستم", callback_data: "menu_status" }
+  ]);
+
+  let selectedDisplay = currentSelected;
+  if (currentSelected === "auto_free") selectedDisplay = "🎁 خودکار هوشمند (فقط رایگان‌ها)";
+  else if (currentSelected === "auto") selectedDisplay = "💎 خودکار (تمام مدل‌ها)";
+
+  const filterText = filterType === "free" ? "فقط مدل‌های رایگان 🎁" : "همه مدل‌ها 💎";
+  const menuText = `🤖 **مدل‌های هوش مصنوعی \`${providerHost}\` (${filterText}):**\n` +
+    `⭐ مدل انتخابی فعلی: \`${selectedDisplay}\`\n` +
+    `🎁 مدل‌های رایگان با نشان هدیه مشخص شده‌اند.\n` +
+    `📄 صفحه **${safePage + 1}** از **${totalPages}** (نمایش ۱۰ مورد در هر صفحه)\n\n` +
+    `💡 برای مشاهده جزئیات یا تست پینگ هر مدل، روی دکمه آن کلیک کنید:`;
+
+  if (messageIdToEdit) {
+    const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text: menuText,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      })
+    }).then(r => r.json()).catch(() => null);
+    if (editRes && editRes.ok) return;
+  }
+
+  return sendTelegramMessage(botToken, chatId, menuText, buttons);
+}
+
+// ============================================================================
+// تست دسته‌جمعی سلامت و پینگ مدل‌ها با کنترل نرخ ضد ۴۲۹ (runBatchModelTest)
+// ============================================================================
+async function runBatchModelTest(botToken, chatId, env, sys, isAdmin, filterType = "free", batchIndex = 0, messageIdToEdit = null) {
+  const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0] || {
+    id: "current",
+    name: "پیش‌فرض سیستم",
+    baseUrl: sys.baseUrl || CONFIG.DEFAULT_BASE_URL
+  };
+  const testBase = smartNormalizeBaseUrl(activeProv.baseUrl || sys.baseUrl || CONFIG.DEFAULT_BASE_URL);
+  const providerHost = testBase.replace(/^https?:\/\//, "").split("/")[0];
+  const keys = getOrderedKeys(sys);
+  const testKey = (sys.apiKeys && sys.apiKeys[0]?.key) || activeProv?.apiKey || keys[0]?.key || "";
+
+  if (!testKey) {
+    return sendTelegramMessage(botToken, chatId, "❌ کلید API ثبت نشده است. ابتدا با دستور `/setkey` کلید خود را ثبت فرمایید.");
+  }
+
+  const discovery = await fetchLiveModelsFromProvider(env, sys, false);
+  const candidates = filterType === "free"
+    ? (discovery.freeModels.length > 0 ? discovery.freeModels : discovery.models)
+    : discovery.models;
+
+  if (candidates.length === 0) {
+    return sendTelegramMessage(botToken, chatId, `⚠️ هیچ مدلی برای تست در ارائه‌دهنده \`${providerHost}\` یافت نشد.`);
+  }
+
+  const batchSize = 5;
+  const totalBatches = Math.max(1, Math.ceil(candidates.length / batchSize));
+  const safeBatch = Math.max(0, Math.min(batchIndex, totalBatches - 1));
+  const modelsToTest = candidates.slice(safeBatch * batchSize, (safeBatch + 1) * batchSize);
+
+  const waitNotice = `⏳ **در حال اجرای تست سلامت و پینگ دسته‌جمعی...**\n\n` +
+    `🌐 ارائه‌دهنده: \`${providerHost}\`\n` +
+    `📂 دسته انتخابی: **${filterType === "free" ? "مدل‌های رایگان 🎁" : "همه مدل‌ها 💎"}** (بخش ${safeBatch + 1} از ${totalBatches})\n` +
+    `🎯 در حال سنجش ۵ مدل زیر:\n` +
+    modelsToTest.map((m, i) => `  ${i + 1}. \`${m}\``).join("\n") + `\n\n` +
+    `🛡️ **محافظ هوشمند ضد ۴۲۹ (Anti-RateLimit):**\n` +
+    `پروب‌ها با تاخیر هوشمند ۱.۲ ثانیه‌ای ارسال می‌شوند تا سهمیه ارائه‌دهنده مسدود نگردد. لطفاً چند لحظه شکیبا باشید...`;
+
+  if (messageIdToEdit) {
+    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text: waitNotice,
+        parse_mode: "Markdown"
+      })
+    }).catch(() => {});
+  } else {
+    await sendTelegramMessage(botToken, chatId, waitNotice);
+  }
+
+  const results = [];
+  for (let i = 0; i < modelsToTest.length; i++) {
+    const m = modelsToTest[i];
+    await sendChatAction(botToken, chatId, "typing");
+    const testRes = await testModelLatencyAndHealth(testBase, testKey, m);
+    results.push({ model: m, ...testRes });
+
+    // تاخیر هوشمند کنترل‌شده بین تست‌ها برای پیشگیری قطعی از خطای 429 (Too Many Requests)
+    if (i < modelsToTest.length - 1) {
+      const delayMs = testRes.isRateLimit ? 2500 : 1200;
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+
+  const successfulModels = results.filter(r => r.ok);
+
+  let reportText = `🧪 **گزارش ارزیابی دسته‌جمعی پینگ و سلامت مدل‌ها:**\n\n` +
+    `🌐 **ارائه‌دهنده:** **${activeProv.name}** (\`${providerHost}\`)\n` +
+    `📑 **بخش:** **${safeBatch + 1}** از **${totalBatches}** (${filterType === "free" ? "مدل‌های رایگان 🎁" : "تمام مدل‌ها 💎"})\n` +
+    `📊 **نتیجه تست:** **${successfulModels.length}** از **${modelsToTest.length}** مدل با موفقیت پاسخ دادند.\n\n` +
+    `⚠️ **نکته بسیار مهم درباره خطای ۴۲۹ (Rate Limit):**\n` +
+    `ارائه‌دهندگان برای کلیدهای رایگان سقف درخواست در دقیقه دارند. پروب‌ها با تاخیر محافظتی ارسال شدند؛ اما اگر ارائه‌دهنده در آن لحظه شلوغ باشد، ممکن است علامت 🔴 دریافت کنید. در این شرایط از مدل‌های سبز 🟢 استفاده کنید یا پس از ۱ الی ۲ دقیقه مجدداً تست فرمایید.\n\n` +
+    `📋 **جزئیات تست هر مدل:**\n` +
+    results.map((r, idx) => {
+      if (r.ok) {
+        return `${idx + 1}. 🟢 \`${r.model}\`\n    ⚡ تاخیر: **${r.latencyMs}ms** | 💬 _${(r.reply || "OK").slice(0, 30)}_`;
+      } else {
+        const errDesc = r.status === 429 ? "🔴 محدودیت سهمیه (429 Rate Limit)" : `🔴 خطا: ${r.error || "بدون پاسخ"}`;
+        return `${idx + 1}. \`${r.model}\`\n    ⚠️ ${errDesc}`;
+      }
+    }).join("\n\n");
+
+  const buttons = [];
+  // دکمه‌های انتخاب سریع برای مدل‌هایی که موفق بودند
+  for (const s of successfulModels.slice(0, 2)) {
+    const label = s.model.length > 25 ? s.model.slice(0, 23) + "…" : s.model;
+    buttons.push([{ text: `⭐ فعال‌سازی ${label} (${s.latencyMs}ms)`, callback_data: `apply_model:${s.model}` }]);
+  }
+
+  // دکمه‌های ناوبری دسته‌ها
+  const navRow = [];
+  if (safeBatch > 0) {
+    navRow.push({ text: "◀️ ۵ مدل قبلی", callback_data: `batch_test:${filterType}:${safeBatch - 1}` });
+  }
+  if (safeBatch < totalBatches - 1) {
+    navRow.push({ text: `۵ مدل بعدی ▶️ (${safeBatch + 2}/${totalBatches})`, callback_data: `batch_test:${filterType}:${safeBatch + 1}` });
+  }
+  if (navRow.length > 0) buttons.push(navRow);
+
+  // دکمه‌های بازگشت
+  buttons.push([
+    { text: "🔄 تست مجدد همین بخش", callback_data: `batch_test:${filterType}:${safeBatch}` },
+    { text: "🤖 منوی مدل‌ها", callback_data: "menu_models" }
+  ]);
+  buttons.push([
+    { text: "📊 وضعیت سیستم (/status)", callback_data: "menu_status" }
+  ]);
+
+  if (messageIdToEdit) {
+    const editRes = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageIdToEdit,
+        text: reportText,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      })
+    }).then(r => r.json()).catch(() => null);
+    if (editRes && editRes.ok) return;
+  }
+
+  return sendTelegramMessage(botToken, chatId, reportText, buttons);
 }
 
 // ============================================================================
 // مدیریت کلیک روی دکمه‌های شیشه‌ای تلگرام (handleCallbackQuery)
 // ============================================================================
-async function handleCallbackQuery(query, env, botToken) {
+async function handleCallbackQuery(query, env, botToken, workerOrigin = "") {
   const chatId = query.message.chat.id;
   const userId = String(query.from.id);
   const data = query.data;
+  const msgId = query.message?.message_id;
   const sys = await getSystemState(env);
   const isAdmin = sys.adminId === userId;
   const member = !isAdmin ? sys.members[userId] : null;
@@ -796,6 +1680,51 @@ async function handleCallbackQuery(query, env, botToken) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ callback_query_id: query.id })
   }).catch(() => {});
+
+  if (data === "menu_start") {
+    return sendStartMenu(botToken, chatId, env, sys, isAdmin, query.from.first_name, workerOrigin, query.message?.message_id);
+  }
+
+  if (data === "menu_sponsor" && isAdmin) {
+    return sendSponsorMenu(botToken, chatId, sys, query.message?.message_id);
+  }
+
+  if (data === "toggle_sponsor_lock" && isAdmin) {
+    sys.sponsorLock = sys.sponsorLock === false ? true : false;
+    await storagePut(env, "SYS_STATE", sys);
+    return sendSponsorMenu(botToken, chatId, sys, query.message?.message_id);
+  }
+
+  if (data === "wz_add_channel" && isAdmin) {
+    await storagePut(env, `WIZARD_${userId}`, JSON.stringify({ step: "add_channel" }), { expirationTtl: 600 });
+    const text = `📢 **افزودن کانال به قفل جوین اجباری:**\n\n` +
+      `لطفاً آیدی یا یوزرنیم کانال را با @ ارسال فرمایید (مثلاً: \`@MyChannel\` یا \`-1001234567890\`):\n\n` +
+      `💡 *نکته:* حتماً ربات را از قبل در کانال مدیر (Admin) کنید تا دسترسی بررسی اعضا را داشته باشد.\n` +
+      `*(برای انصراف عبارت /cancel را بفرستید)*`;
+    return sendTelegramMessage(botToken, chatId, text, [
+      [{ text: "❌ انصراف", callback_data: "wz_cancel_sponsor" }]
+    ]);
+  }
+
+  if (data === "wz_cancel_sponsor" && isAdmin) {
+    await storageDelete(env, `WIZARD_${userId}`);
+    return sendSponsorMenu(botToken, chatId, sys, query.message?.message_id);
+  }
+
+  if (data.startsWith("del_channel:") && isAdmin) {
+    const idx = parseInt(data.slice("del_channel:".length), 10);
+    if (sys.sponsorChannels && sys.sponsorChannels[idx]) {
+      sys.sponsorChannels.splice(idx, 1);
+      await storagePut(env, "SYS_STATE", sys);
+    }
+    return sendSponsorMenu(botToken, chatId, sys, query.message?.message_id);
+  }
+
+  if (data === "toggle_public_mode" && isAdmin) {
+    sys.publicMode = sys.publicMode === false ? true : false;
+    await storagePut(env, "SYS_STATE", sys);
+    return sendStartMenu(botToken, chatId, env, sys, isAdmin, query.from.first_name, workerOrigin, query.message?.message_id);
+  }
 
   if (data.startsWith("cancel_req:")) {
     const reqId = data.slice("cancel_req:".length);
@@ -815,47 +1744,263 @@ async function handleCallbackQuery(query, env, botToken) {
     userMem.mode = chosenMode;
     await saveActiveChatMemory(env, userId, userMem);
     const labelMap = {
-      chat: "💡 **حالت چت ساده و پرسش و پاسخ فعال شد.**",
-      work: "💼 **حالت کارمند حرفه‌ای فعال شد.**",
-      custom: "🎭 **حالت شخصیت سفارشی فعال شد.**"
+      chat: "💡 حالت چت ساده و روزمره فعال شد",
+      work: "💼 حالت کارمند حرفه‌ای و برنامه‌نویس فعال شد",
+      custom: "🎭 حالت شخصیت سفارشی فعال شد"
     };
-    return sendTelegramMessage(botToken, chatId, labelMap[chosenMode] || "✅ حالت تغییر کرد.");
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: query.id, text: labelMap[chosenMode] || "✅ حالت دستیار تغییر کرد" })
+    }).catch(() => {});
+    return sendStartMenu(botToken, chatId, env, sys, isAdmin, query.from.first_name, workerOrigin, msgId);
   }
 
   if (data === "check_sponsor") {
     const res = await checkSponsorJoin(botToken, sys, userId);
-    if (res.ok) return sendTelegramMessage(botToken, chatId, "✅ عضویت شما تایید شد! اکنون می‌توانید پیام خود را بفرستید.");
-    return sendTelegramMessage(botToken, chatId, "⚠️ هنوز در همه کانال‌های اسپانسر عضو نشده‌اید.");
+    if (res.ok) return sendTelegramMessage(botToken, chatId, "🎉 **عضویت شما با موفقیت تایید شد!**\nاکنون هر سوال یا درخواستی دارید بفرمایید تا پاسخ دهم.");
+    return sendTelegramMessage(botToken, chatId, "⚠️ هنوز در همه کانال‌های تعیین‌شده عضو نشده‌اید. لطفاً ابتدا عضو شوید و سپس دکمه تایید را بزنید.");
   }
   if (data === "new_chat" || data === "clear_chat") {
     ACTIVE_USER_LOCKS.delete(userId);
     const currentMem = await getActiveChatMemory(env, userId);
     await createNewChatSession(env, userId, currentMem.mode || "chat");
-    return sendTelegramMessage(botToken, chatId, "✨ گفتگوی جدید ساخته شد. پیام خود را بفرستید!");
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: query.id, text: "✨ گفتگوی جدید ساخته شد" })
+    }).catch(() => {});
+    return sendStartMenu(botToken, chatId, env, sys, isAdmin, query.from.first_name, workerOrigin, msgId);
   }
   if (data === "history_menu") {
-    return sendHistoryMenu(botToken, env, chatId, userId);
+    return sendHistoryMenu(botToken, env, chatId, userId, msgId);
   }
   if (data.startsWith("switch_sess:")) {
     const sessId = data.slice("switch_sess:".length);
     await storagePut(env, `ACTIVE_SESS_${userId}`, sessId);
-    return sendTelegramMessage(botToken, chatId, "🔄 گفتگو به سشن انتخاب‌شده منتقل شد.");
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: query.id, text: "🔄 گفتگو به سشن انتخاب‌شده منتقل شد" })
+    }).catch(() => {});
+    return sendHistoryMenu(botToken, env, chatId, userId, msgId);
   }
-  if (data === "menu_models" || data === "refresh_models") {
-    return sendModelMenu(botToken, chatId, env, sys, true, customUserConfig, isAdmin, "all");
+  if (data === "noop") {
+    return;
+  }
+  if (data === "menu_status") {
+    return sendStatusCard(botToken, chatId, env, sys, isAdmin, query.message?.message_id);
+  }
+  if (data === "menu_models") {
+    return sendModelMenu(botToken, chatId, env, sys, false, customUserConfig, isAdmin, "all", 0, msgId);
+  }
+  if (data.startsWith("refresh_models")) {
+    const parts = data.split(":");
+    const fType = parts[1] || "all";
+    const pNum = parseInt(parts[2] || "0", 10) || 0;
+    return sendModelMenu(botToken, chatId, env, sys, true, customUserConfig, isAdmin, fType, pNum, query.message?.message_id);
   }
   if (data.startsWith("filter_models:")) {
-    const fType = data.slice("filter_models:".length);
-    return sendModelMenu(botToken, chatId, env, sys, false, customUserConfig, isAdmin, fType);
+    const parts = data.split(":");
+    const fType = parts[1] || "all";
+    return sendModelMenu(botToken, chatId, env, sys, false, customUserConfig, isAdmin, fType, 0, query.message?.message_id);
+  }
+  if (data.startsWith("page_models:")) {
+    const parts = data.split(":");
+    const fType = parts[1] || "all";
+    const pNum = parseInt(parts[2] || "0", 10) || 0;
+    return sendModelMenu(botToken, chatId, env, sys, false, customUserConfig, isAdmin, fType, pNum, query.message?.message_id);
+  }
+  if (data.startsWith("batch_test:") && isAdmin) {
+    const parts = data.split(":");
+    const fType = parts[1] || "free";
+    const bIndex = parseInt(parts[2] || "0", 10) || 0;
+    return runBatchModelTest(botToken, chatId, env, sys, isAdmin, fType, bIndex, query.message?.message_id);
   }
   if (data === "menu_providers" && isAdmin) {
-    const provs = sys.providers || [];
-    const buttons = provs.map(p => [{
-      text: `${p.isDefault ? "🟢 " : ""}${p.name} (${p.baseUrl.replace(/^https?:\/\//, "").split("/")[0]})`,
-      callback_data: `set_provider:${p.id}`
-    }]);
-    return sendTelegramMessage(botToken, chatId, "🌐 **لیست ارائه‌دهنده‌ها (انتخاب سریع سرور):**", buttons);
+    return sendProvidersMenu(botToken, chatId, sys, msgId);
   }
+
+  if (data.startsWith("view_prov:") && isAdmin) {
+    const pId = data.slice("view_prov:".length);
+    const p = (sys.providers || []).find(x => x.id === pId);
+    if (p) {
+      return sendProviderDetailCard(botToken, chatId, p, p.isDefault, (sys.providers || []).length, msgId);
+    }
+  }
+
+  if (data.startsWith("test_prov_ping:") && isAdmin) {
+    const pId = data.slice("test_prov_ping:".length);
+    let p = (sys.providers || []).find(x => x.id === pId);
+    if (!p || pId === "current") {
+      p = (sys.providers || []).find(x => x.isDefault) || {
+        id: "current",
+        name: "سرور فعال سیستم",
+        baseUrl: sys.baseUrl || CONFIG.DEFAULT_BASE_URL,
+        apiKey: (sys.apiKeys && sys.apiKeys[0]?.key) || ""
+      };
+    }
+    if (p) {
+      await sendTelegramMessage(botToken, chatId, `⏳ در حال ارسال پروب تستی و پینگ سرور **${p.name}**...`);
+      const testKey = p.apiKey || (sys.apiKeys && sys.apiKeys[0]?.key) || "";
+      const probe = await autoDetectAndTestBaseUrl(p.baseUrl, testKey);
+      if (probe.success) {
+        return sendTelegramMessage(botToken, chatId, `🟢 **پینگ سرور با موفقیت انجام شد!**\n\n🌐 سرور: **${p.name}**\n🔗 آدرس کارساز: \`${probe.workingUrl}\`\n📡 کد وضعیت: **${probe.status} OK**\n✅ ارتباط کاملاً پایدار و آماده استفاده است.`, [
+          [{ text: "⭐ فعال‌سازی این سرور", callback_data: `set_provider:${p.id}` }],
+          [{ text: "🔙 بازگشت به لیست سرورها", callback_data: "menu_providers" }]
+        ]);
+      } else {
+        return sendTelegramMessage(botToken, chatId, `❌ **خطا در برقراری ارتباط با سرور:**\n\n🌐 سرور: **${p.name}**\n🔗 آدرس: \`${p.baseUrl}\`\n⚠️ پیام خطا: ${probe.error || "پاسخی دریافت نشد"}`, [
+          [{ text: "⚡ تلاش مجدد", callback_data: `test_prov_ping:${p.id}` }],
+          [{ text: "🔙 بازگشت به لیست سرورها", callback_data: "menu_providers" }]
+        ]);
+      }
+    }
+  }
+
+  if (data.startsWith("view_prov_models:") && isAdmin) {
+    const pId = data.slice("view_prov_models:".length);
+    const p = (sys.providers || []).find(x => x.id === pId);
+    if (p) {
+      sys.providers.forEach(x => x.isDefault = false);
+      p.isDefault = true;
+      sys.baseUrl = p.baseUrl;
+      if (p.apiKey) {
+        sys.apiKeys = sys.apiKeys || [];
+        const existing = sys.apiKeys.findIndex(k => k.key === p.apiKey);
+        if (existing >= 0) {
+          sys.activeKeyIndex = existing;
+          sys.apiKeys[existing].status = "active";
+        } else {
+          sys.apiKeys.unshift({ key: p.apiKey, status: "active", label: p.name });
+          sys.activeKeyIndex = 0;
+        }
+      }
+      sys.cachedModels = [];
+      sys.cachedFreeModels = [];
+      await storagePut(env, "SYS_STATE", sys);
+      return sendModelMenu(botToken, chatId, env, sys, true, customUserConfig, isAdmin, "all", 0, msgId);
+    }
+  }
+
+  if (data.startsWith("del_prov:") && isAdmin) {
+    const pId = data.slice("del_prov:".length);
+    const provs = sys.providers || [];
+    if (provs.length <= 1) {
+      return sendTelegramMessage(botToken, chatId, "⚠️ این تنها سرور ثبت‌شده سیستم است و امکان حذف آن وجود ندارد.");
+    }
+    const wasDefault = provs.some(x => x.id === pId && x.isDefault);
+    sys.providers = provs.filter(x => x.id !== pId);
+    if (wasDefault && sys.providers.length > 0) {
+      sys.providers[0].isDefault = true;
+      sys.baseUrl = sys.providers[0].baseUrl;
+    }
+    sys.cachedModels = [];
+    sys.cachedFreeModels = [];
+    await storagePut(env, "SYS_STATE", sys);
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: query.id, text: "🗑 سرور حذف شد" })
+    }).catch(() => {});
+    return sendProvidersMenu(botToken, chatId, sys, msgId);
+  }
+
+  if (data === "wz_start_prov" && isAdmin) {
+    await storagePut(env, `WIZARD_${userId}`, JSON.stringify({ step: "prov_name" }), { expirationTtl: 600 });
+    return sendWizardStep1(botToken, chatId);
+  }
+
+  if (data.startsWith("wz_name:") && isAdmin) {
+    const chosenName = data.slice("wz_name:".length);
+    const wState = { step: "prov_url", name: chosenName };
+    await storagePut(env, `WIZARD_${userId}`, JSON.stringify(wState), { expirationTtl: 600 });
+    return sendWizardStep2(botToken, chatId, chosenName);
+  }
+
+  if (data.startsWith("wz_url:") && isAdmin) {
+    const chosenUrl = data.slice("wz_url:".length);
+    const wizardRaw = await storageGet(env, `WIZARD_${userId}`);
+    const wState = wizardRaw ? JSON.parse(wizardRaw) : { name: "ارائه‌دهنده" };
+    wState.baseUrl = smartNormalizeBaseUrl(chosenUrl);
+    wState.step = "prov_key";
+    await storagePut(env, `WIZARD_${userId}`, JSON.stringify(wState), { expirationTtl: 600 });
+    return sendWizardStep3(botToken, chatId, wState.name, wState.baseUrl);
+  }
+
+  if (data === "wz_key_none" && isAdmin) {
+    const wizardRaw = await storageGet(env, `WIZARD_${userId}`);
+    const wState = wizardRaw ? JSON.parse(wizardRaw) : {};
+    await storageDelete(env, `WIZARD_${userId}`);
+    return finishProviderWizard(env, sys, botToken, chatId, wState.name || "سرور اختصاصی", wState.baseUrl || sys.baseUrl, "");
+  }
+
+  if (data === "wz_cancel") {
+    await storageDelete(env, `WIZARD_${userId}`);
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: query.id, text: "❌ افزودن سرور لغو شد" })
+    }).catch(() => {});
+    return sendProvidersMenu(botToken, chatId, sys, msgId);
+  }
+
+  if (data.startsWith("pick_model:")) {
+    const m = data.slice("pick_model:".length);
+    const isFree = (sys.cachedFreeModels || []).includes(m);
+    return sendModelDetailCard(botToken, chatId, m, sys, isFree, msgId);
+  }
+
+  if (data.startsWith("apply_model:") || data.startsWith("set_model:")) {
+    const m = data.startsWith("apply_model:") ? data.slice("apply_model:".length) : data.slice("set_model:".length);
+    if (isAdmin) {
+      sys.selectedModel = m;
+      await storagePut(env, "SYS_STATE", sys);
+    } else if (member) {
+      member.customModel = (m === "auto" || m === "auto_free") ? "" : m;
+      await storagePut(env, "SYS_STATE", sys);
+    }
+    const isAuto = m === "auto" || m === "auto_free";
+    const buttons = isAuto
+      ? [
+          [{ text: "🤖 مشاهده لیست مدل‌ها", callback_data: "menu_models" }],
+          [{ text: "📊 وضعیت سیستم (/status)", callback_data: "menu_status" }]
+        ]
+      : [
+          [{ text: "🧪 تست پینگ این مدل", callback_data: `test_model_tg:${m}` }],
+          [{ text: "🤖 مشاهده سایر مدل‌ها", callback_data: "menu_models" }]
+        ];
+
+    let mTitle = m;
+    if (m === "auto_free") mTitle = "🎁 خودکار هوشمند (فقط مدل‌های رایگان - 100% Free)";
+    else if (m === "auto") mTitle = "💎 خودکار (تمام مدل‌های موجود)";
+
+    return editOrSendMessage(botToken, chatId, `✅ **مدل با موفقیت برای ربات تنظیم شد!**\n\n🤖 مدل فعال: **${mTitle}**\nاز این پس پیام‌های شما با این مدل پاسخ داده خواهد شد.`, buttons, msgId);
+  }
+
+  if (data.startsWith("test_model_tg:")) {
+    const m = data.slice("test_model_tg:".length);
+    const testBase = smartNormalizeBaseUrl(sys.baseUrl);
+    const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0];
+    const testKey = (sys.apiKeys && sys.apiKeys[0]?.key) || activeProv?.apiKey || "";
+
+    await sendTelegramMessage(botToken, chatId, `⏳ در حال ارسال پروب تستی و سنجش پینگ مدل \`${m}\` (مصرف میکروتوکن)...`);
+    const testRes = await testModelLatencyAndHealth(testBase, testKey, m);
+    if (testRes.ok) {
+      const buttons = [
+        [{ text: "⭐ انتخاب و فعال‌سازی این مدل روی ربات", callback_data: `apply_model:${m}` }],
+        [{ text: "🧪 تست مجدد", callback_data: `test_model_tg:${m}` }, { text: "🔙 بازگشت به لیست مدل‌ها", callback_data: "menu_models" }]
+      ];
+      return sendTelegramMessage(botToken, chatId, `🟢 **تست پینگ و سلامت مدل موفقیت‌آمیز بود!**\n\n🤖 مدل: \`${m}\`\n⚡ تاخیر پاسخ‌دهی (Latency): **${testRes.latencyMs}ms**\n📡 کد وضعیت: **200 OK**\n💬 پاسخ تستی: _${testRes.reply || "OK"}_\n\nآیا مایلید این مدل برای ربات فعال شود؟`, buttons);
+    } else {
+      const buttons = [
+        [{ text: "🧪 تلاش مجدد", callback_data: `test_model_tg:${m}` }],
+        [{ text: "🔙 بازگشت به لیست مدل‌ها", callback_data: "menu_models" }]
+      ];
+      return sendTelegramMessage(botToken, chatId, `❌ **خطا در تست مدل:**\n\n🤖 مدل: \`${m}\`\n⏱ تاخیر: ${testRes.latencyMs}ms\n⚠️ پیام خطا: ${testRes.error || "نامشخص"}`, buttons);
+    }
+  }
+
   if (data.startsWith("set_provider:") && isAdmin) {
     const pId = data.slice("set_provider:".length);
     const p = (sys.providers || []).find(x => x.id === pId);
@@ -877,7 +2022,12 @@ async function handleCallbackQuery(query, env, botToken) {
       sys.cachedModels = [];
       sys.cachedFreeModels = [];
       await storagePut(env, "SYS_STATE", sys);
-      return sendTelegramMessage(botToken, chatId, `✅ ارائه‌دهنده فعال تغییر کرد به: **${p.name}**\nآدرس: \`${p.baseUrl}\``);
+      await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callback_query_id: query.id, text: `✅ ارائه‌دهنده به ${p.name} تغییر یافت` })
+      }).catch(() => {});
+      return sendModelMenu(botToken, chatId, env, sys, true, customUserConfig, isAdmin, "all", 0, msgId);
     }
   }
   if (data === "menu_keys" && isAdmin) {
@@ -925,7 +2075,7 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
   }
 
   if (update.callback_query) {
-    return handleCallbackQuery(update.callback_query, env, botToken);
+    return handleCallbackQuery(update.callback_query, env, botToken, workerOrigin);
   }
 
   const msg = update.message;
@@ -950,6 +2100,57 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
   if (!sys.stats) sys.stats = { totalUsers: {}, totalRequests: 0 };
   sys.stats.totalUsers[userId] = Date.now();
   sys.stats.totalRequests = (sys.stats.totalRequests || 0) + 1;
+
+  // اگر هنوز ادمینی تعیین نشده، اولین کاربری که به ربات پیام می‌دهد ادمین می‌شود
+  if (!sys.adminId) {
+    sys.adminId = userId;
+    await storagePut(env, "SYS_STATE", sys);
+    await syncMenuButtons(botToken, chatId, workerOrigin);
+  }
+
+  // رهگیری گام‌های تعاملی ویزارد افزودن سرور (Interactive Step-by-Step Wizard)
+  const wizardRaw = await storageGet(env, `WIZARD_${userId}`);
+  if (wizardRaw && text) {
+    if (text === "/cancel" || text === "انصراف" || text === "لغو") {
+      await storageDelete(env, `WIZARD_${userId}`);
+      return sendTelegramMessage(botToken, chatId, "❌ فرآیند افزودن ارائه‌دهنده لغو شد.", [
+        [{ text: "🌐 بازگشت به لیست سرورها", callback_data: "menu_providers" }]
+      ]);
+    }
+
+    try {
+      const wState = JSON.parse(wizardRaw);
+      if (wState.step === "prov_name") {
+        wState.name = text.trim();
+        wState.step = "prov_url";
+        await storagePut(env, `WIZARD_${userId}`, JSON.stringify(wState), { expirationTtl: 600 });
+        return sendWizardStep2(botToken, chatId, wState.name);
+      } else if (wState.step === "prov_url") {
+        wState.baseUrl = smartNormalizeBaseUrl(text.trim());
+        wState.step = "prov_key";
+        await storagePut(env, `WIZARD_${userId}`, JSON.stringify(wState), { expirationTtl: 600 });
+        return sendWizardStep3(botToken, chatId, wState.name, wState.baseUrl);
+      } else if (wState.step === "prov_key") {
+        const key = text.trim();
+        await storageDelete(env, `WIZARD_${userId}`);
+        return finishProviderWizard(env, sys, botToken, chatId, wState.name, wState.baseUrl, key);
+      } else if (wState.step === "add_channel") {
+        let ch = text.trim();
+        if (!ch.startsWith("@") && !ch.startsWith("-100")) ch = "@" + ch;
+        sys.sponsorChannels = sys.sponsorChannels || [];
+        if (!sys.sponsorChannels.includes(ch)) {
+          sys.sponsorChannels.push(ch);
+        }
+        sys.sponsorLock = true;
+        await storagePut(env, "SYS_STATE", sys);
+        await storageDelete(env, `WIZARD_${userId}`);
+        await sendTelegramMessage(botToken, chatId, `✅ کانال \`${ch}\` با موفقیت به قفل جوین اجباری اضافه و فعال گردید.`);
+        return sendSponsorMenu(botToken, chatId, sys);
+      }
+    } catch (e) {
+      await storageDelete(env, `WIZARD_${userId}`);
+    }
+  }
 
   if (text === "/myid") {
     return sendTelegramMessage(botToken, chatId, `🆔 آیدی عددی شما: \`${userId}\`
@@ -988,20 +2189,30 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
     if (member && member.blocked) {
       return sendTelegramMessage(botToken, chatId, "⛔ حساب شما توسط مدیریت مسدود شده است.");
     }
-    if (!sys.publicMode && !member) {
-      return sendTelegramMessage(botToken, chatId, "⛔ شما مجوز دسترسی به این دستیار را ندارید.");
+    if (sys.publicMode === false && !member) {
+      return sendTelegramMessage(botToken, chatId, "🔒 این ربات در حال حاضر در حالت خصوصی (فقط مدیر) قرار دارد.");
     }
-    if (!member && sys.publicMode) {
-      sys.members[userId] = { name: firstName, dailyLimit: sys.defaultDailyLimit || 20, dailyCount: 0, totalMessages: 0, blocked: false };
+    if (!member && sys.publicMode !== false) {
+      sys.members = sys.members || {};
+      sys.members[userId] = { name: firstName, dailyLimit: 0, dailyCount: 0, totalMessages: 0, blocked: false };
       member = sys.members[userId];
+      await storagePut(env, "SYS_STATE", sys);
     }
 
     if (!isGroup) {
       const sponsor = await checkSponsorJoin(botToken, sys, userId);
       if (!sponsor.ok) {
-        const kb = sponsor.unjoined.map(ch => [{ text: `📢 عضویت در ${ch}`, url: `https://t.me/${ch.replace("@", "")}` }]);
-        kb.push([{ text: "✅ عضو شدم / بررسی مجدد", callback_data: "check_sponsor" }]);
-        return sendTelegramMessage(botToken, chatId, "⚠️ برای استفاده از ربات ابتدا در کانال(های) زیر عضو شوید:", kb);
+        const kb = sponsor.unjoined.map(ch => {
+          const cleanUser = ch.replace(/^@/, "").replace(/^-100/, "");
+          const link = ch.startsWith("-100") ? `https://t.me/c/${cleanUser}` : `https://t.me/${cleanUser}`;
+          return [{ text: `📢 عضویت در کانال ${ch}`, url: link }];
+        });
+        kb.push([{ text: "✅ تایید عضویت و شروع چت", callback_data: "check_sponsor" }]);
+        const lockMsg = `🔒 **دسترسی به هوش مصنوعی نیازمند عضویت در کانال است!**\n\n` +
+          `برای استفاده رایگان و نامحدود، لطفاً ابتدا در کانال(های) زیر عضو شوید:\n\n` +
+          sponsor.unjoined.map(c => `• 📢 \`${c}\``).join("\n") + `\n\n` +
+          `پس از عضویت، روی دکمه **«✅ تایید عضویت و شروع چت»** کلیک فرمایید:`;
+        return sendTelegramMessage(botToken, chatId, lockMsg, kb);
       }
     }
   }
@@ -1028,8 +2239,7 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
     const uUrl = smartNormalizeBaseUrl(rawUrl);
     member.customBaseUrl = uUrl;
     await storagePut(env, "SYS_STATE", sys);
-    return sendTelegramMessage(botToken, chatId, `✅ ارائه‌دهنده اختصاصی شما تنظیم شد به:
-\`${uUrl}\``);
+    return sendTelegramMessage(botToken, chatId, `✅ ارائه‌دهنده اختصاصی شما تنظیم شد به:\n\`${uUrl}\``);
   }
 
   if (!isAdmin && member && text.startsWith("/mymodel ")) {
@@ -1056,53 +2266,54 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
     }
   }
 
+  if (text === "/status") {
+    return sendStatusCard(botToken, chatId, env, sys, isAdmin);
+  }
+
   if (isAdmin && text === "/providers") {
-    const provs = sys.providers || [];
-    if (provs.length === 0) {
-      return sendTelegramMessage(botToken, chatId, "🌐 هنوز ارائه‌دهنده‌ای ثبت نشده است.");
-    }
-    const buttons = provs.map(p => [{
-      text: `${p.isDefault ? "🟢 " : ""}${p.name} (${p.baseUrl.replace(/^https?:\/\//, "").split("/")[0]})`,
-      callback_data: `set_provider:${p.id}`
-    }]);
-    return sendTelegramMessage(botToken, chatId, "🌐 **لیست ارائه‌دهنده‌ها (انتخاب سریع سرور):**", buttons);
+    return sendProvidersMenu(botToken, chatId, sys);
   }
 
   if (text === "/start") {
     ACTIVE_USER_LOCKS.delete(userId);
+    await storageDelete(env, `WIZARD_${userId}`);
     if (isAdmin) {
       await syncMenuButtons(botToken, chatId, workerOrigin);
     }
-    const buttons = isAdmin
-      ? [
-          [{ text: "🎛 پنل مدیریت (Web / Mini App)", web_app: { url: `${workerOrigin}/app` } }],
-          [
-            { text: "💡 چت ساده (/chat)", callback_data: "set_mode:chat" },
-            { text: "💼 کارمند (/work)", callback_data: "set_mode:work" },
-            { text: "🎭 شخصیت سفارشی (/custom)", callback_data: "set_mode:custom" }
-          ],
-          [{ text: "🤖 مدل‌های هوش مصنوعی (/model)", callback_data: "menu_models" }, { text: "🌐 سرورها (/providers)", callback_data: "menu_providers" }],
-          [{ text: "📜 تاریخچه چت‌ها", callback_data: "history_menu" }, { text: "➕ چت جدید (/newchat)", callback_data: "new_chat" }]
-        ]
-      : [
-          [{ text: "🤖 انتخاب مدل (/model)", callback_data: "menu_models" }, { text: "📜 تاریخچه چت‌ها", callback_data: "history_menu" }],
-          [{ text: "➕ چت جدید (/newchat)", callback_data: "new_chat" }]
-        ];
-    const welcomeText = isAdmin
-      ? `سلام! دستیار آماده است.
+    return sendStartMenu(botToken, chatId, env, sys, isAdmin, firstName, workerOrigin);
+  }
 
-**دستورات تغییر حالت سریع:**
-• \`/chat\` : چت ساده و روزمره
-• \`/work\` : کارمند حرفه‌ای و برنامه‌نویس
-• \`/custom\` : شخصیت سفارشی شما
-• \`/model\` : انتخاب مدل (با تفکیک مدل‌های رایگان 🎁)`
-      : `سلام ${firstName}! خوش آمدید.
+  if (isAdmin && (text === "/sponsor" || text === "/channels")) {
+    return sendSponsorMenu(botToken, chatId, sys);
+  }
 
-💡 **قابلیت اتصال کلید شخصی (BYOK):**
-• کلید شخصی: \`/mykey YOUR_KEY\`
-• آدرس ارائه‌دهنده: \`/myurl https://...\`
-• انتخاب مدل: \`/model\``;
-    return sendTelegramMessage(botToken, chatId, welcomeText, buttons);
+  if (isAdmin && text.startsWith("/addchannel ")) {
+    let ch = text.replace("/addchannel ", "").trim();
+    if (!ch.startsWith("@") && !ch.startsWith("-100")) ch = "@" + ch;
+    sys.sponsorChannels = sys.sponsorChannels || [];
+    if (!sys.sponsorChannels.includes(ch)) sys.sponsorChannels.push(ch);
+    sys.sponsorLock = true;
+    await storagePut(env, "SYS_STATE", sys);
+    await sendTelegramMessage(botToken, chatId, `✅ کانال \`${ch}\` با موفقیت به قفل جوین اجباری اضافه و فعال شد.`);
+    return sendSponsorMenu(botToken, chatId, sys);
+  }
+
+  if (isAdmin && text.startsWith("/delchannel ")) {
+    let ch = text.replace("/delchannel ", "").trim();
+    if (!ch.startsWith("@") && !ch.startsWith("-100")) ch = "@" + ch;
+    sys.sponsorChannels = (sys.sponsorChannels || []).filter(c => c !== ch);
+    await storagePut(env, "SYS_STATE", sys);
+    await sendTelegramMessage(botToken, chatId, `🗑 کانال \`${ch}\` حذف شد.`);
+    return sendSponsorMenu(botToken, chatId, sys);
+  }
+
+  if (isAdmin && (text === "/public" || text.startsWith("/public "))) {
+    const arg = text.replace("/public", "").trim().toLowerCase();
+    if (arg === "on" || arg === "1" || arg === "true") sys.publicMode = true;
+    else if (arg === "off" || arg === "0" || arg === "false") sys.publicMode = false;
+    else sys.publicMode = !sys.publicMode;
+    await storagePut(env, "SYS_STATE", sys);
+    return sendTelegramMessage(botToken, chatId, sys.publicMode ? "🌍 دسترسی عمومی فعال شد (همه کاربران می‌توانند از هوش مصنوعی استفاده کنند)." : "🔒 دسترسی به ربات خصوصی شد (فقط مدیر مجاز است).");
   }
 
   if (text === "/clear" || text === "/newchat") {
@@ -1121,11 +2332,13 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
   }
 
   if (isAdmin && text.startsWith("/setmodel ")) {
-    const customModel = text.replace("/setmodel ", "").trim();
+    let customModel = text.replace("/setmodel ", "").trim();
+    if (customModel === "free") customModel = "auto_free";
     if (customModel) {
       sys.selectedModel = customModel;
       await storagePut(env, "SYS_STATE", sys);
-      return sendTelegramMessage(botToken, chatId, `✅ مدل فعال دستی تنظیم شد به: **${customModel}**`);
+      const label = customModel === "auto_free" ? "🎁 انتخاب خودکار هوشمند (فقط رایگان)" : (customModel === "auto" ? "💎 انتخاب خودکار (همه مدل‌ها)" : customModel);
+      return sendTelegramMessage(botToken, chatId, `✅ مدل فعال تنظیم شد به: **${label}**`);
     }
   }
 
@@ -1133,16 +2346,125 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
     return sendKeysMenu(botToken, chatId, sys);
   }
 
-  if (isAdmin && text.startsWith("/addkey ")) {
-    const newKey = text.replace("/addkey ", "").trim();
-    if (newKey.length > 8) {
+  if (isAdmin && (text.startsWith("/setkey ") || text.startsWith("/addkey "))) {
+    const newKey = text.replace(/^\/(setkey|addkey)\s+/, "").trim();
+    if (newKey.length > 5) {
       sys.apiKeys = sys.apiKeys || [];
-      sys.apiKeys.push({ key: newKey, status: "active", label: `Key #${sys.apiKeys.length + 1}` });
+      const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0];
+      const keyLabel = activeProv ? `${activeProv.name} Key` : `Key #${sys.apiKeys.length + 1}`;
+
+      const existingIdx = sys.apiKeys.findIndex(k => k.key === newKey);
+      if (existingIdx >= 0) {
+        sys.apiKeys[existingIdx].status = "active";
+        sys.activeKeyIndex = existingIdx;
+      } else {
+        sys.apiKeys.unshift({ key: newKey, status: "active", label: keyLabel });
+        sys.activeKeyIndex = 0;
+      }
+      if (activeProv) {
+        activeProv.apiKey = newKey;
+      }
       sys.cachedModels = [];
       sys.cachedFreeModels = [];
       await storagePut(env, "SYS_STATE", sys);
-      return sendTelegramMessage(botToken, chatId, `✅ کلید جدید **Key #${sys.apiKeys.length}** اضافه شد.`);
+
+      await sendTelegramMessage(botToken, chatId, "⏳ کلید ثبت شد! در حال واکشی و استخراج زنده مدل‌ها از ارائه‌دهنده...");
+      const discovery = await fetchLiveModelsFromProvider(env, sys, true);
+      if (discovery.models.length > 0) {
+        return sendTelegramMessage(botToken, chatId, `✅ **کلید با موفقیت ثبت و تایید شد!**\n\n🎯 سرور فعال: **${activeProv?.name || "پیش‌فرض"}**\n🤖 تعداد مدل‌های شناسایی‌شده: **${discovery.models.length}**\n🎁 مدل‌های رایگان: **${discovery.freeModels.length}**\n\nبرای انتخاب مدل دستور \`/model\` را بفرستید.`);
+      } else {
+        return sendTelegramMessage(botToken, chatId, `⚠️ کلید ذخیره شد ولی لیستی از مدل‌ها دریافت نشد.\nعلت: ${discovery.error || "نامشخص"}`);
+      }
+    } else {
+      return sendTelegramMessage(botToken, chatId, "⚠️ کلید وارد شده نامعتبر است. لطفاً کلید کامل را ارسال کنید:\n`/setkey AIzaSy...`");
     }
+  }
+
+  if (isAdmin && text.startsWith("/addprovider ")) {
+    const rawArgs = text.replace("/addprovider ", "").trim();
+    const parts = rawArgs.split(/\s+/);
+    if (parts.length < 2) {
+      return sendTelegramMessage(botToken, chatId, `📖 **راهنمای افزودن ارائه‌دهنده از تلگرام:**\n\nفرمت دستور:\n\`/addprovider <نام> <آدرس BaseUrl> [کلید API]\`\n\n**نمونه‌ها:**\n• \`/addprovider Groq https://api.groq.com/openai/v1 gsk_123...\`\n• \`/addprovider OpenRouter https://openrouter.ai/api/v1 sk-or-...\`\n• \`/addprovider Custom https://api.my-server.com/v1\``);
+    }
+    const name = parts[0];
+    const rawUrl = parts[1];
+    const key = parts[2] || "";
+    const normUrl = smartNormalizeBaseUrl(rawUrl);
+
+    const newProv = {
+      id: `prov_${Date.now()}`,
+      name: name,
+      baseUrl: normUrl,
+      apiKey: key,
+      enabled: true,
+      isDefault: true
+    };
+    sys.providers = sys.providers || [];
+    sys.providers.forEach(p => p.isDefault = false);
+    sys.providers.push(newProv);
+    sys.baseUrl = normUrl;
+    if (key) {
+      sys.apiKeys = sys.apiKeys || [];
+      sys.apiKeys.unshift({ key, status: "active", label: name });
+      sys.activeKeyIndex = 0;
+    }
+    sys.cachedModels = [];
+    sys.cachedFreeModels = [];
+    await storagePut(env, "SYS_STATE", sys);
+
+    await sendTelegramMessage(botToken, chatId, `⏳ ارائه‌دهنده **${name}** با آدرس \`${normUrl}\` اضافه شد. در حال استخراج مدل‌ها...`);
+    const discovery = await fetchLiveModelsFromProvider(env, sys, true);
+    if (discovery.models.length > 0) {
+      return sendTelegramMessage(botToken, chatId, `🎉 **ارائه‌دهنده جدید متصل شد!**\n\n🌐 نام سرور: **${name}**\n🤖 مدل‌ها: **${discovery.models.length}** مدل (🎁 ${discovery.freeModels.length} رایگان)\n\nبا دستور \`/model\` مدل مورد نظرتان را انتخاب کنید.`);
+    } else {
+      return sendTelegramMessage(botToken, chatId, `✅ سرور **${name}** ثبت شد.\n⚠️ خطا در واکشی مدل‌ها: ${discovery.error || "بدون مدل"}`);
+    }
+  }
+
+  if (isAdmin && text.startsWith("/seturl ")) {
+    const rawUrl = text.replace("/seturl ", "").trim();
+    if (!rawUrl) return sendTelegramMessage(botToken, chatId, "⚠️ لطفاً آدرس را وارد کنید: `/seturl https://...`");
+    const normUrl = smartNormalizeBaseUrl(rawUrl);
+    sys.baseUrl = normUrl;
+    const activeProv = (sys.providers || []).find(p => p.isDefault);
+    if (activeProv) activeProv.baseUrl = normUrl;
+    sys.cachedModels = [];
+    sys.cachedFreeModels = [];
+    await storagePut(env, "SYS_STATE", sys);
+    return sendTelegramMessage(botToken, chatId, `🌐 آدرس سرور پیش‌فرض سیستم تغییر کرد به:\n\`${normUrl}\``);
+  }
+
+  if (isAdmin && (text === "/testfree" || text === "/batchtest")) {
+    return runBatchModelTest(botToken, chatId, env, sys, isAdmin, "free", 0);
+  }
+
+  if (isAdmin && text === "/testall") {
+    return runBatchModelTest(botToken, chatId, env, sys, isAdmin, "all", 0);
+  }
+
+  if (isAdmin && (text === "/test" || text.startsWith("/test "))) {
+    const modelToTest = text.replace("/test", "").trim() || sys.selectedModel || "gemini-2.5-flash";
+    const activeProv = (sys.providers || []).find(p => p.isDefault) || sys.providers?.[0];
+    const testBase = smartNormalizeBaseUrl(sys.baseUrl);
+    const testKey = (sys.apiKeys && sys.apiKeys[0]?.key) || activeProv?.apiKey || "";
+
+    if (!testKey) {
+      return sendTelegramMessage(botToken, chatId, "❌ هیچ کلید API برای تست ثبت نشده است. ابتدا با دستور `/setkey YOUR_KEY` کلید خود را ثبت کنید.");
+    }
+
+    await sendTelegramMessage(botToken, chatId, `⏳ در حال ارسال پروب تستی و سنجش پینگ مدل \`${modelToTest}\`...`);
+    const testRes = await testModelLatencyAndHealth(testBase, testKey, modelToTest);
+    if (testRes.ok) {
+      return sendTelegramMessage(botToken, chatId, `🟢 **تست پینگ موفقیت‌آمیز بود!**\n\n⚡ تاخیر پاسخ‌دهی (Latency): **${testRes.latencyMs}ms**\n🤖 مدل: \`${modelToTest}\`\n🌐 سرور: \`${testBase}\`\n💬 پاسخ کوتاه تست: _${testRes.reply || "OK"}_`);
+    } else {
+      return sendTelegramMessage(botToken, chatId, `❌ **خطا در تست مدل:**\n\n🤖 مدل: \`${modelToTest}\`\n⏱ تاخیر: ${testRes.latencyMs}ms\n⚠️ جزئیات خطا: ${testRes.error || "نامشخص"}`);
+    }
+  }
+
+  if (isAdmin && (text === "/panel" || text === "/admin")) {
+    await syncMenuButtons(botToken, chatId, workerOrigin);
+    const btn = [[{ text: "🎛 باز کردن مینی‌اپ مدیریت", web_app: { url: `${workerOrigin}/app` } }]];
+    return sendTelegramMessage(botToken, chatId, `🎛 **پنل مدیریت ربات و مینی‌اپ:**\n\nمی‌توانید از دکمه زیر پنل را باز کنید، یا آدرس زیر را در مرورگر باز نمایید:\n${workerOrigin}/app`, btn);
   }
 
   if (isAdmin && text.startsWith("/remind ")) {
@@ -1249,8 +2571,7 @@ async function processTelegramUpdate(update, env, ctx, botToken, workerOrigin) {
     if (msg.photo) {
       const largestPhoto = msg.photo[msg.photo.length - 1];
       imageBase64 = await downloadTelegramFileAsBase64(botToken, largestPhoto.file_id);
-      enrichedUserPrompt = (text || "این تصویر را با دقت تحلیل کن.") + "
-[پیوست: تصویر]";
+      enrichedUserPrompt = (text || "این تصویر را با دقت تحلیل کن.") + "\n[پیوست: تصویر]";
     } else if (msg.document) {
       const fileContent = await extractDocumentContent(botToken, msg.document);
       enrichedUserPrompt = `${text}
@@ -1314,7 +2635,11 @@ ${marketData}`;
     if (!aiResponse.success) {
       userMem.messages.pop();
       await saveActiveChatMemory(env, userId, userMem);
-      await sendTelegramMessage(botToken, chatId, `⚠️ ${aiResponse.error}`);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⚠️ **خطا در دریافت پاسخ از هوش مصنوعی:**\n${aiResponse.error}\n\n💡 **راهنما:**\n• جهت انتخاب یک مدل دیگر از دستور \`/model\` استفاده نمایید.\n• برای بررسی وضعیت پینگ سرور و کلید از دستور \`/status\` استفاده کنید.`
+      );
       return;
     }
 
@@ -1346,7 +2671,28 @@ ${marketData}`;
     if (replyText.includes("```")) {
       quickButtons.push([{ text: "📦 دریافت به صورت ZIP", callback_data: "make_zip_last" }]);
     }
-    await sendTelegramMessage(botToken, chatId, replyText, quickButtons);
+
+    // شفاف‌سازی کامل مدل پاسخ‌دهنده، نام ارائه‌دهنده، وضعیت رایگان بودن، Failover و تاخیر
+    const rawBaseUrl = customUserConfig?.baseUrl || sys.baseUrl || CONFIG.DEFAULT_BASE_URL;
+    const providerHost = rawBaseUrl.replace(/^https?:\/\//, "").split("/")[0];
+    const usedModel = aiResponse.model || sys.selectedModel || "auto_free";
+    const latency = aiResponse.latencyMs || 0;
+    const isFreeTag = (sys.cachedFreeModels || []).includes(usedModel) || usedModel.includes(":free") || usedModel.includes("-free") ? " (🎁 رایگان)" : "";
+
+    let footer = "";
+    if (aiResponse.isFailover) {
+      if (aiResponse.failoverReason === "rate_limit_429") {
+        footer = `\n\n—\n⚠️ _مدل انتخابی شما (\`${aiResponse.requestedModel}\`) موقتاً با محدودیت نرخ ارائه‌دهنده (۴۲۹) مواجه شد؛ جهت جلوگیری از معطلی، پاسخ با موفقیت از مدل جایگزین دریافت شد:_\n🤖 مدل پاسخ‌دهنده: \`${usedModel}\`${isFreeTag} | 🌐 \`${providerHost}\` | ⚡ ${latency}ms`;
+      } else {
+        footer = `\n\n—\n⚠️ _مدل انتخابی شما (\`${aiResponse.requestedModel}\`) در سرور با تاخیر یا شلوغی مواجه شد؛ سیستم هوشمند پاسخ را از مدل پشتیبان دریافت کرد:_\n🤖 مدل پاسخ‌دهنده: \`${usedModel}\`${isFreeTag} | 🌐 \`${providerHost}\` | ⚡ ${latency}ms`;
+      }
+    } else if (aiResponse.failoverReason === "rate_limit_429") {
+      footer = `\n\n—\n🤖 مدل: \`${usedModel}\`${isFreeTag} (سوئیچ خودکار ضد ۴۲۹) | 🌐 \`${providerHost}\` | ⚡ ${latency}ms`;
+    } else {
+      footer = `\n\n—\n🤖 مدل: \`${usedModel}\`${isFreeTag} | 🌐 \`${providerHost}\` | ⚡ ${latency}ms`;
+    }
+
+    await sendTelegramMessage(botToken, chatId, replyText + footer, quickButtons);
   } catch (err) {
     await sendTelegramMessage(botToken, chatId, `⚠️ خطای داخلی در پردازش پیام: ${err.message}`);
   } finally {
@@ -1398,13 +2744,15 @@ async function updateSessionTitle(env, userId, sessId, newTitle) {
   }
 }
 
-async function sendHistoryMenu(botToken, env, chatId, userId) {
+async function sendHistoryMenu(botToken, env, chatId, userId, messageIdToEdit = null) {
   const listRaw = await storageGet(env, `SESS_LIST_${userId}`);
   const activeSessId = await storageGet(env, `ACTIVE_SESS_${userId}`);
   const list = listRaw ? JSON.parse(listRaw) : [];
 
   if (list.length === 0) {
-    return sendTelegramMessage(botToken, chatId, "📜 هنوز تاریخچه‌ای ثبت نشده است.");
+    const text = "📜 هنوز تاریخچه‌ای ثبت نشده است.";
+    const buttons = [[{ text: "🔙 بازگشت به منوی اصلی", callback_data: "menu_start" }]];
+    return editOrSendMessage(botToken, chatId, text, buttons, messageIdToEdit);
   }
 
   const buttons = list.slice(0, 10).map(s => [{
@@ -1412,8 +2760,9 @@ async function sendHistoryMenu(botToken, env, chatId, userId) {
     callback_data: `switch_sess:${s.id}`
   }]);
   buttons.push([{ text: "➕ شروع گفتگوی جدید", callback_data: "new_chat" }]);
+  buttons.push([{ text: "🔙 بازگشت به منوی اصلی", callback_data: "menu_start" }]);
 
-  await sendTelegramMessage(botToken, chatId, "📜 **تاریخچه گفتگوهای شما:**", buttons);
+  return editOrSendMessage(botToken, chatId, "📜 **تاریخچه گفتگوهای شما:**", buttons, messageIdToEdit);
 }
 
 async function handleGalleryPhotoOutput(botToken, chatId, sys, replyText) {
@@ -1516,44 +2865,56 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
   const discovery = await fetchLiveModelsFromProvider(env, sys, false, customUserConfig);
   const liveModels = discovery.models.length > 0 ? discovery.models : CONFIG.FALLBACK_MODELS;
 
-  const preferredModel = customUserConfig?.model || sys.selectedModel;
-  let modelQueue = [];
-  if (preferredModel && preferredModel !== "auto") {
-    modelQueue.push(preferredModel);
-  }
-  for (const m of liveModels) {
-    if (!modelQueue.includes(m)) modelQueue.push(m);
-  }
+  const preferredModel = customUserConfig?.model || sys.selectedModel || "auto_free";
+  const freeModels = discovery.freeModels || [];
+  const modelQueue = buildDiverseModelQueue(preferredModel, liveModels, freeModels);
 
   const formattedMessages = buildCleanMessages(systemPrompt, messages, imageBase64, isAdmin, currentMode);
 
   let keysUpdated = false;
   let lastErrorDetail = discovery.error || "";
+  let lastRateLimitedModel = null;
+  const startTime = Date.now();
+  const isAutoMode = preferredModel === "auto" || preferredModel === "auto_free";
+  const maxAttempts = isAutoMode ? 6 : 5;
+  const modelsToAttempt = modelQueue.slice(0, maxAttempts);
 
   for (const keyObj of keysToTry) {
-    for (const model of modelQueue.slice(0, 8)) {
+    for (let i = 0; i < modelsToAttempt.length; i++) {
+      const model = modelsToAttempt[i];
+      const isPreferred = !isAutoMode && model === preferredModel;
+      const isFailover = !isAutoMode && model !== preferredModel;
+      // مدل انتخابی دستی کاربر تا ۱۸ ثانیه فرصت دارد؛ حالت خودکار و جایگزین‌ها ۹ ثانیه
+      const timeoutMs = isPreferred ? 18000 : 9000;
+
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 35000);
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-        const isReasoning = /^(o1|o3|deepseek-r1|deepseek-reasoner)/i.test(model);
+        // فقط مدل‌های o1 و o3 متعلق به OpenAI نیازمند نقش developer و max_completion_tokens هستند
+        const isOpenAIO = /^(o1|o3)/i.test(model);
+        const isDeepSeekR1 = /(deepseek-r1|deepseek-reasoner)/i.test(model);
+
         const processedMessages = formattedMessages.map(m => {
-          if (isReasoning && m.role === "system") {
+          if (isOpenAIO && m.role === "system") {
             return { role: "developer", content: m.content || " " };
           }
           return { role: m.role, content: m.content || " " };
         });
+
+        // سقف توکن بالا (۴۰۹۶) برای تضمین پاسخ کامل و جامع و جلوگیری از بریده‌شدن متن‌های طولانی
+        const targetMaxTokens = isAdmin ? 8192 : 4096;
 
         const payload = {
           model: model,
           messages: processedMessages
         };
 
-        if (isReasoning) {
-          payload.max_completion_tokens = isAdmin ? 4096 : 1500;
+        if (isOpenAIO) {
+          payload.max_completion_tokens = targetMaxTokens;
         } else {
-          payload.temperature = currentMode === "custom" ? 0.85 : (currentMode === "work" ? 0.2 : 0.7);
-          payload.max_tokens = isAdmin ? 4096 : 1500;
+          payload.temperature = isDeepSeekR1 ? 0.6 : (currentMode === "custom" ? 0.85 : (currentMode === "work" ? 0.2 : 0.7));
+          payload.max_tokens = targetMaxTokens;
         }
 
         const headers = {
@@ -1585,7 +2946,7 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
             const healedPayload = {
               model: model,
               messages: healedMessages,
-              max_tokens: isAdmin ? 4096 : 1500
+              max_tokens: targetMaxTokens
             };
             try {
               const healRes = await fetch(`${baseUrl}/chat/completions`, {
@@ -1599,7 +2960,16 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
                 const reply = cleanModelOutput(rawReply);
                 if (reply) {
                   if (keysUpdated) await storagePut(env, "SYS_STATE", sys);
-                  return { success: true, content: reply };
+                  return {
+                    success: true,
+                    content: reply,
+                    model: model,
+                    requestedModel: preferredModel,
+                    isFailover: isFailover,
+                    failoverReason: lastRateLimitedModel ? "rate_limit_429" : (i > 0 ? "fallback" : null),
+                    baseUrl: baseUrl,
+                    latencyMs: Date.now() - startTime
+                  };
                 }
               }
             } catch (hErr) {}
@@ -1617,9 +2987,11 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
         }
 
         if (res.status === 429) {
+          markModelRateLimited(model, 60000);
+          lastRateLimitedModel = model;
           lastErrorDetail = `محدودیت نرخ (429) روی مدل ${model}`;
-          // Graceful backoff before attempting next fallback
-          await new Promise(r => setTimeout(r, 1200));
+          // تاخیر کوتاه محافظتی ۲۰۰ میلی‌ثانیه‌ای و سوئیچ فوری به خانواده ارائه‌دهنده بعدی
+          await new Promise(r => setTimeout(r, 200));
           continue;
         }
 
@@ -1634,7 +3006,16 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
         const reply = cleanModelOutput(rawReply);
         if (reply) {
           if (keysUpdated) await storagePut(env, "SYS_STATE", sys);
-          return { success: true, content: reply };
+          return {
+            success: true,
+            content: reply,
+            model: model,
+            requestedModel: preferredModel,
+            isFailover: isFailover,
+            failoverReason: lastRateLimitedModel ? "rate_limit_429" : (i > 0 ? "fallback" : null),
+            baseUrl: baseUrl,
+            latencyMs: Date.now() - startTime
+          };
         }
       } catch (err) {
         lastErrorDetail = `خطای شبکه/تایم‌اوت روی مدل ${model}: ${err.message}`;
@@ -1644,9 +3025,12 @@ async function callAIWithFailover(env, sys, systemPrompt, messages, imageBase64,
   }
 
   if (keysUpdated) await storagePut(env, "SYS_STATE", sys);
+  const failureHint = (lastErrorDetail && lastErrorDetail.includes("429"))
+    ? "\n💡 نکته: سهمیه درخواست در دقیقه (Rate Limit 429) تمام مدل‌های آزموده‌شده پر بود. لطفاً ۳۰ تا ۶۰ ثانیه شکیبا باشید یا از ارائه‌دهنده دیگری استفاده کنید."
+    : "";
   return {
     success: false,
-    error: `مدل‌ها در آدرس \`${baseUrl}\` پاسخ ندادند.\nجزئیات آخرین خطا: ${lastErrorDetail || "نامشخص"}`
+    error: `مدل‌ها در سرور \`${baseUrl}\` پاسخ ندادند.\nجزئیات آخرین خطا: ${lastErrorDetail || "نامشخص"}${failureHint}`
   };
 }
 
@@ -2054,11 +3438,15 @@ async function handleSetupAPI(request, env, origin) {
       await syncMenuButtons(token, adminId, origin);
     }
 
+    const hasKv = Boolean(env.BOT_KV);
+    const extraMsg = !hasKv ? "<br><br>⚠️ <b>نکته:</b> حافظه BOT_KV متصل نیست. برای ماندگاری دائمی، بایندینگ BOT_KV را در تنظیمات کلادفلر اضافه کنید." : "";
+
     return new Response(JSON.stringify({
       ok: true,
+      hasKv,
       bot: botInfo,
       webhook: whData,
-      message: `ربات @${botInfo.username} با موفقیت متصل شد و وب‌هوک روی ${webhookUrl} تنظیم شد.`
+      message: `ربات @${botInfo.username} با موفقیت متصل شد و وب‌هوک روی ${webhookUrl} تنظیم شد.${extraMsg}`
     }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
@@ -2080,14 +3468,16 @@ async function handleAdminAPI(request, env, botToken, origin) {
   const adminSecret = request.headers.get("X-Admin-Secret") || "";
 
   let isAuthorized = false;
-  if (initData) {
-    isAuthorized = await verifyAdminWebApp(initData, botToken, sys.adminId);
+  if (initData && (await verifyAdminWebApp(initData, botToken, sys.adminId))) {
+    isAuthorized = true;
   } else if (adminSecret && sys.webSecret && adminSecret === sys.webSecret) {
     isAuthorized = true;
   } else if (adminSecret && sys.bridgeSecret && adminSecret === sys.bridgeSecret) {
     isAuthorized = true;
-  } else if (!sys.botToken && !sys.webSecret && !sys.adminId) {
-    // Only completely unconfigured system allows initial setup without secret
+  } else if (!sys.webSecret) {
+    // دسترسی مستقیم در صورت عدم تعیین رمز پنل وب باز است
+    isAuthorized = true;
+  } else if (!sys.botToken && !sys.adminId) {
     isAuthorized = true;
   }
 
@@ -2348,7 +3738,7 @@ async function handleAdminAPI(request, env, botToken, origin) {
 // ============================================================================
 // صفحه فرود راه‌اندازی اولیه تحت وب (renderSetupHTML)
 // ============================================================================
-function renderSetupHTML(sys, botToken, origin) {
+function renderSetupHTML(sys, botToken, origin, hasKv = true) {
   const isConfigured = Boolean(botToken && botToken !== "YOUR_TELEGRAM_BOT_TOKEN");
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -2381,6 +3771,14 @@ function renderSetupHTML(sys, botToken, origin) {
   <div style="text-align:center;"><span class="badge">V8.0 PRO - OpenCode & Cherry Studio Edition</span></div>
   <h2>🚀 راه‌اندازی و اتصال ربات تلگرام</h2>
   <p class="desc">توکن ربات خود را وارد کنید تا وب‌هوک به صورت خودکار روی این ورکر تنظیم شود و ربات آماده پاسخ‌گویی گردد.</p>
+
+  ${!hasKv ? `
+    <div style="background:#451a03;border:1px solid #b45309;color:#fde68a;padding:12px;border-radius:10px;margin-bottom:16px;font-size:12px;line-height:1.6;text-align:right;">
+      ⚠️ <b>توجه مهم (حافظه ابری BOT_KV متصل نیست):</b><br>
+      هنوز بایندینگ <b>BOT_KV</b> در کلادفلر متصل نشده است. برای پایداری و ذخیره دائمی توکن، در کلادفلر به <b>Settings &gt; Bindings</b> بروید و یک KV با نام <b>BOT_KV</b> متصل کنید.<br>
+      <i>(همچنین می‌توانید توکن را مستقیم در خط ۱۸ فایل worker.js بگذارید).</i>
+    </div>
+  ` : ""}
 
   ${isConfigured ? `
     <div class="existing-box">
@@ -2462,166 +3860,554 @@ async function connectBot() {
 }
 
 // ============================================================================
+// ============================================================================
 // پنل پیشرفته مدیریت ایجنت، ارائه‌دهنده‌ها و مدل‌ها (renderMiniAppHTML)
-// سبک OpenCode، Cherry Studio و Chatbox با تست زنده پینگ و تفکیک رایگان
+// نسخه فوق پیشرفته، کاملاً ریسپانسیو و روان (Mobile & Desktop)
 // ============================================================================
 function renderMiniAppHTML(sys, botToken, origin) {
+  const safeSysJson = JSON.stringify(sys).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>پنل مدیریت هوشمند EdgePulse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  body { font-family: Tahoma, 'Vazirmatn', sans-serif; background: #0b0d11; color: #f1f5f9; padding: 12px; margin: 0; }
-  .header-bar { background: #14171f; border-radius: 14px; padding: 12px 16px; margin-bottom: 12px; border: 1px solid #232936; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-  .brand-title { color: #38bdf8; font-size: 15px; font-weight: bold; }
-  .badge-tag { font-size: 11px; padding: 3px 8px; border-radius: 6px; background: #1e2430; color: #94a3b8; border: 1px solid #2c3545; }
-  .tabs-nav { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 12px; }
-  .tab-btn { background: #171b24; color: #94a3b8; border: 1px solid #262e3d; padding: 8px 12px; border-radius: 8px; font-size: 12px; cursor: pointer; white-space: nowrap; transition: 0.2s; }
-  .tab-btn.active { background: #0284c7; color: #fff; font-weight: bold; border-color: #38bdf8; }
-  .card { background: #14171f; border-radius: 14px; padding: 14px; margin-bottom: 14px; border: 1px solid #232936; }
-  h3 { margin-top: 0; color: #38bdf8; font-size: 14px; border-bottom: 1px solid #232936; padding-bottom: 8px; }
-  label.lbl { display: block; margin-top: 10px; font-size: 12px; color: #94a3b8; }
-  input, textarea, select { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #2a3342; background: #1b202a; color: #fff; font-size: 12px; outline: none; }
-  input:focus, textarea:focus { border-color: #38bdf8; }
-  button { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 10px; border-radius: 8px; border: none; background: #0284c7; color: #fff; font-weight: bold; font-size: 12px; cursor: pointer; transition: 0.2s; }
-  button:hover { opacity: 0.9; }
-  button:active { transform: scale(0.98); }
-  .btn-sm { width: auto; padding: 4px 8px; margin: 0; font-size: 11px; }
-  .btn-green { background: #16a34a; }
-  .btn-red { background: #dc2626; }
-  .btn-warn { background: #d97706; }
-  .btn-purple { background: #7c3aed; }
-  .item-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #1f2532; gap: 6px; font-size: 12px; }
-  .provider-card { background: #181d26; border: 1px solid #2a3342; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
-  .provider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .preset-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; margin-bottom: 8px; }
-  .preset-btn { background: #1c222c; border: 1px solid #334155; font-size: 11px; padding: 6px; margin: 0; color: #cbd5e1; }
-  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; text-align: center; }
-  .stat-box { background: #11141a; padding: 10px; border-radius: 10px; border: 1px solid #232936; }
-  .filter-nav { display: flex; gap: 6px; margin-top: 10px; margin-bottom: 10px; }
-  .filter-btn { background: #1b202a; border: 1px solid #2e3848; color: #94a3b8; padding: 5px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; }
-  .filter-btn.active { background: #0284c7; color: #fff; font-weight: bold; border-color: #38bdf8; }
-  .model-table { max-height: 400px; overflow-y: auto; font-size: 12px; margin-top: 8px; }
-  .model-item { background: #171c24; border: 1px solid #262f3d; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; }
-  .badge-free { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-  .badge-std { background: #1e293b; color: #94a3b8; border: 1px solid #334155; padding: 2px 6px; border-radius: 4px; font-size: 10px; }
-  .latency-tag { font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; }
-  .auth-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; justify-content: center; align-items: center; z-index: 1000; padding: 16px; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  :root {
+    --bg-base: #080c14;
+    --bg-card: rgba(17, 24, 39, 0.75);
+    --border-card: rgba(255, 255, 255, 0.08);
+    --primary: #0284c7;
+    --primary-hover: #0369a1;
+    --primary-glow: rgba(2, 132, 199, 0.35);
+    --cyan: #38bdf8;
+    --emerald: #10b981;
+    --amber: #f59e0b;
+    --rose: #ef4444;
+    --purple: #8b5cf6;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+  }
+  body {
+    font-family: 'Vazirmatn', -apple-system, BlinkMacSystemFont, Tahoma, sans-serif;
+    background: var(--bg-base);
+    color: var(--text-main);
+    margin: 0;
+    padding: 12px 12px 40px 12px;
+    max-width: 860px;
+    margin-inline: auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* Toast Notification */
+  .toast {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    transform: translate(-50%, -80px);
+    background: #1e293b;
+    color: #f8fafc;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    padding: 9px 18px;
+    border-radius: 30px;
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+    z-index: 99999;
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 0.25s cubic-bezier(0.18, 0.89, 0.32, 1.28), opacity 0.25s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 90vw;
+  }
+  .toast.show {
+    transform: translate(-50%, 0);
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .toast-success { background: #064e3b; border-color: #059669; color: #a7f3d0; }
+  .toast-error { background: #7f1d1d; border-color: #dc2626; color: #fecaca; }
+  .toast-info { background: #0c4a6e; border-color: #0284c7; color: #bae6fd; }
+
+  /* Header Bar */
+  .header-bar {
+    background: var(--bg-card);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-radius: 16px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border-card);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  }
+  .brand-group { display: flex; align-items: center; gap: 8px; }
+  .brand-title { color: var(--cyan); font-size: 15px; font-weight: 800; display: flex; align-items: center; gap: 6px; }
+  .status-badges { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+  .badge-pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 20px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 1px solid transparent;
+  }
+  .badge-neutral { background: rgba(148, 163, 184, 0.12); color: #cbd5e1; border-color: rgba(148, 163, 184, 0.2); }
+  .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+  .badge-primary { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3); }
+  .badge-purple { background: rgba(139, 92, 246, 0.15); color: #a78bfa; border-color: rgba(139, 92, 246, 0.3); }
+  .badge-free { background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); padding: 2px 7px; border-radius: 6px; font-size: 10.5px; font-weight: 700; }
+  .badge-std { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); padding: 2px 7px; border-radius: 6px; font-size: 10.5px; }
+
+  /* Tabs Bar */
+  .tabs-nav {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 2px 2px 8px 2px;
+    margin-bottom: 12px;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tabs-nav::-webkit-scrollbar { display: none; }
+  .tab-btn {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    background: rgba(22, 30, 48, 0.7);
+    color: var(--text-muted);
+    border: 1px solid var(--border-card);
+    padding: 9px 13px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .tab-btn:hover { background: rgba(30, 41, 65, 0.9); color: #f1f5f9; }
+  .tab-btn.active {
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
+    color: #ffffff;
+    border-color: var(--cyan);
+    box-shadow: 0 3px 12px var(--primary-glow);
+  }
+
+  /* Card Layout */
+  .card {
+    background: var(--bg-card);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border-card);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  }
+  h3 {
+    margin: 0 0 10px 0;
+    color: var(--cyan);
+    font-size: 13.5px;
+    font-weight: 700;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    padding-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .card-subtitle { font-size: 11.5px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5; }
+
+  /* Inputs & Forms */
+  label.lbl { display: block; margin-top: 10px; font-size: 11.5px; font-weight: 600; color: #cbd5e1; }
+  input, textarea, select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    margin-top: 6px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(13, 19, 33, 0.85);
+    color: #ffffff;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  input:focus, textarea:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+  }
+  textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
+
+  /* Buttons */
+  button {
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .btn-primary {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 11px 14px;
+    margin-top: 10px;
+    border-radius: 10px;
+    border: none;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
+    color: #fff;
+    font-weight: 700;
+    font-size: 12.5px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 2px 10px rgba(2, 132, 199, 0.3);
+  }
+  .btn-primary:hover { opacity: 0.94; transform: translateY(-1px); }
+  .btn-primary:active { transform: scale(0.98); }
+
+  .btn-sm {
+    width: auto;
+    padding: 6px 10px;
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 8px;
+    border: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .btn-sm:hover { opacity: 0.92; }
+  .btn-sm:active { transform: scale(0.96); }
+
+  .btn-green { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
+  .btn-purple { background: linear-gradient(135deg, #8b5cf6, #6d28d9); color: #fff; }
+  .btn-red { background: linear-gradient(135deg, #ef4444, #b91c1c); color: #fff; }
+  .btn-warn { background: linear-gradient(135deg, #f59e0b, #d97706); color: #fff; }
+  .btn-ghost { background: rgba(255, 255, 255, 0.07); color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.1); }
+  .btn-ghost:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+
+  /* Presets Responsive Grid */
+  .preset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 6px;
+    margin-top: 8px;
+    margin-bottom: 10px;
+  }
+  .preset-btn {
+    background: rgba(22, 31, 50, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 9px;
+    color: #cbd5e1;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 8px 6px;
+    text-align: center;
+    width: 100%;
+    margin: 0;
+  }
+  .preset-btn:hover { background: rgba(35, 48, 77, 0.95); border-color: var(--cyan); color: var(--cyan); }
+  .preset-btn:active { transform: scale(0.97); }
+
+  /* Provider Card */
+  .provider-card {
+    background: rgba(18, 25, 42, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 12px;
+    margin-bottom: 8px;
+    transition: all 0.2s;
+  }
+  .provider-card.active-prov {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(14, 28, 52, 0.9);
+    box-shadow: 0 0 15px rgba(2, 132, 199, 0.12);
+  }
+  .provider-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .prov-details {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    direction: ltr;
+    text-align: left;
+    word-break: break-all;
+    background: rgba(0, 0, 0, 0.25);
+    padding: 6px 8px;
+    border-radius: 6px;
+  }
+
+  /* Filter Navigation */
+  .filter-nav { display: flex; gap: 6px; margin: 10px 0; overflow-x: auto; padding-bottom: 2px; }
+  .filter-btn {
+    background: rgba(22, 31, 50, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: 0.15s;
+  }
+  .filter-btn.active {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--cyan);
+    font-weight: 700;
+  }
+
+  /* Model Catalog List */
+  .model-table {
+    max-height: 480px;
+    overflow-y: auto;
+    font-size: 12px;
+    margin-top: 8px;
+    padding-right: 2px;
+  }
+  .model-item {
+    background: rgba(17, 24, 39, 0.75);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 9px 11px;
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    transition: background 0.15s;
+  }
+  .model-item:hover { background: rgba(26, 36, 58, 0.85); }
+  .model-item.selected-model {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(14, 30, 56, 0.85);
+  }
+  .model-name {
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #f8fafc;
+    direction: ltr;
+    text-align: left;
+    word-break: break-all;
+  }
+  .latency-tag {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Simple Rows */
+  .item-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 9px 10px;
+    border-radius: 8px;
+    background: rgba(15, 22, 36, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    margin-bottom: 6px;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  /* Auth Modal */
+  .auth-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(4, 7, 13, 0.88);
+    backdrop-filter: blur(8px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 10000;
+    padding: 16px;
+  }
+
+  .empty-state {
+    padding: 24px 12px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
 </style>
 </head>
 <body>
 
+<div id="toast" class="toast"></div>
+
+<!-- Auth Box Modal -->
 <div id="authBox" class="auth-overlay" style="display:none;">
-  <div class="card" style="max-width:380px;width:100%;border-color:#38bdf8;">
-    <h3 style="text-align:center;">🔐 احراز هویت پنل مدیریت</h3>
-    <p style="font-size:12px;color:#94a3b8;line-height:1.6;text-align:center;">برای مدیریت خارج از تلگرام، رمز عبور پنل را وارد کنید:</p>
-    <input id="loginSecret" type="password" dir="ltr" placeholder="رمز عبور پنل وب">
-    <button onclick="doLogin()">ورود به پنل</button>
+  <div class="card" style="max-width:390px;width:100%;border-color:var(--cyan);background:#0e1422;box-shadow:0 10px 35px rgba(0,0,0,0.8);">
+    <h3 style="text-align:center;justify-content:center;">🔐 احراز هویت پنل مدیریت EdgePulse</h3>
+    <p style="font-size:12px;color:var(--text-muted);line-height:1.7;text-align:center;margin:8px 0 12px 0;">
+      برای دسترسی مستقیم از مرورگر وب، رمز عبور پنل را وارد نمایید:
+    </p>
+    <input id="loginSecret" type="password" dir="ltr" placeholder="رمز عبور پنل وب" style="text-align:center;font-size:13px;">
+    <button type="button" class="btn-primary" onclick="doLogin()">ورود به پنل</button>
   </div>
 </div>
 
+<!-- Header -->
 <div class="header-bar">
-  <div>
-    <span class="brand-title">🎛 EdgePulse AI Agent</span>
-    <span class="badge-tag">OpenCode & Cherry Edition</span>
+  <div class="brand-group">
+    <span class="brand-title">⚡ EdgePulse Studio</span>
+    <span class="badge-pill badge-neutral">v8.0 PRO</span>
   </div>
-  <div style="display:flex;gap:4px;">
-    <span id="headerBotUser" class="badge-tag">ربات: در حال بررسی...</span>
-    <span id="headerActiveModel" class="badge-tag">مدل: auto</span>
+  <div class="status-badges">
+    <span id="headerBotUser" class="badge-pill badge-neutral">ربات: در حال بررسی...</span>
+    <span id="headerActiveProv" class="badge-pill badge-purple">سرور: ...</span>
+    <span id="headerActiveModel" class="badge-pill badge-primary">مدل: auto</span>
   </div>
 </div>
 
+<!-- Navigation Tabs -->
 <div class="tabs-nav">
-  <button class="tab-btn active" onclick="switchTab('providers')">🌐 ارائه‌دهنده‌ها و مدل‌ها</button>
-  <button class="tab-btn" onclick="switchTab('bot')">🤖 ربات و وب‌هوک</button>
-  <button class="tab-btn" onclick="switchTab('souls')">🎭 شخصیت‌ها و مودها</button>
-  <button class="tab-btn" onclick="switchTab('users')">👥 اعضا و سهمیه‌ها</button>
-  <button class="tab-btn" onclick="switchTab('sponsors')">📢 اسپانسر و زمان‌بندی</button>
-  <button class="tab-btn" onclick="switchTab('media')">📸 رسانه و پل لینوکس</button>
+  <button type="button" class="tab-btn active" data-tab="providers"><span style="font-size:14px;">🌐</span> ارائه‌دهنده‌ها و مدل‌ها</button>
+  <button type="button" class="tab-btn" data-tab="bot"><span style="font-size:14px;">🤖</span> تنظیمات ربات و وب‌هوک</button>
+  <button type="button" class="tab-btn" data-tab="souls"><span style="font-size:14px;">🎭</span> شخصیت‌ها و مودها</button>
+  <button type="button" class="tab-btn" data-tab="users"><span style="font-size:14px;">👥</span> اعضا و سهمیه‌ها</button>
+  <button type="button" class="tab-btn" data-tab="sponsors"><span style="font-size:14px;">📢</span> اسپانسر و زمان‌بندی</button>
+  <button type="button" class="tab-btn" data-tab="media"><span style="font-size:14px;">📸</span> رسانه و پل لینوکس</button>
 </div>
 
 <!-- ==================== TAB 1: PROVIDERS & MODELS ==================== -->
 <div id="tab-providers">
   <div class="card">
-    <h3>➕ افزودن ارائه‌دهنده جدید (OpenCode / CCR / Cherry Studio)</h3>
-    <div class="preset-grid">
-      <button class="preset-btn" onclick="applyPreset('google')">Google Gemini</button>
-      <button class="preset-btn" onclick="applyPreset('groq')">Groq Cloud</button>
-      <button class="preset-btn" onclick="applyPreset('openrouter')">OpenRouter</button>
-      <button class="preset-btn" onclick="applyPreset('deepseek')">DeepSeek</button>
-      <button class="preset-btn" onclick="applyPreset('tokenharbor')">TokenHarbor</button>
-      <button class="preset-btn" onclick="applyPreset('ccr')">سرور CCR اختصاصی</button>
-    </div>
-    <label class="lbl">نام ارائه‌دهنده:</label>
-    <input id="provName" placeholder="مثلاً: Groq Cloud یا سرور CCR شخصی">
+    <h3>➕ افزودن ارائه‌دهنده هوش مصنوعی (OpenCode / Custom / Cherry)</h3>
+    <div class="card-subtitle">سریعاً یکی از سرویس‌های زیر را انتخاب کنید یا سرور اختصاصی خود را متصل فرمایید:</div>
     
-    <label class="lbl">آدرس Base URL (بدون نیاز به نگرانی، خودکار اصلاح می‌شود):</label>
+    <div class="preset-grid">
+      <button type="button" class="preset-btn" onclick="applyPreset('google')">Google Gemini</button>
+      <button type="button" class="preset-btn" onclick="applyPreset('groq')">Groq Cloud (فوق‌سریع)</button>
+      <button type="button" class="preset-btn" onclick="applyPreset('openrouter')">OpenRouter</button>
+      <button type="button" class="preset-btn" onclick="applyPreset('deepseek')">DeepSeek Official</button>
+      <button type="button" class="preset-btn" onclick="applyPreset('tokenharbor')">TokenHarbor</button>
+      <button type="button" class="preset-btn" onclick="applyPreset('custom')">سرور اختصاصی (Custom)</button>
+    </div>
+
+    <label class="lbl">نام ارائه‌دهنده:</label>
+    <input id="provName" placeholder="مثلاً: Custom Provider یا Groq Cloud">
+
+    <label class="lbl">آدرس Base URL (بدون نیاز به نگرانی، خودکار تصحیح می‌شود):</label>
     <div style="display:flex;gap:6px;margin-top:6px;">
       <input id="provUrl" dir="ltr" placeholder="https://api.groq.com/openai/v1" style="margin:0;">
-      <button class="btn-sm btn-purple" style="white-space:nowrap;width:auto;" onclick="detectUrl()">🪄 اصلاح و تست هوشمند</button>
+      <button type="button" class="btn-sm btn-purple" style="white-space:nowrap;width:auto;" onclick="detectUrl()">🪄 تست و اصلاح</button>
     </div>
-    <div id="urlDetectResult" style="font-size:11px;color:#38bdf8;margin-top:4px;"></div>
+    <div id="urlDetectResult" style="font-size:11px;color:var(--cyan);margin-top:4px;"></div>
 
     <label class="lbl">کلید API (API Key):</label>
-    <input id="provKey" dir="ltr" placeholder="gsk_... یا sk-or-... یا AIza...">
+    <div style="display:flex;gap:6px;margin-top:6px;">
+      <input id="provKey" type="password" dir="ltr" placeholder="gsk_... یا sk-or-... یا AIza..." style="margin:0;">
+      <button type="button" class="btn-sm btn-ghost" style="white-space:nowrap;width:auto;" onclick="toggleKeyVisibility('provKey')">👁 نمایش</button>
+    </div>
 
-    <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;">
-      <input type="checkbox" id="provDefault" style="width:auto;margin:0;" checked> ارائه‌دهنده پیش‌فرض و فعال ربات باشد
+    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;cursor:pointer;">
+      <input type="checkbox" id="provDefault" style="width:auto;margin:0;" checked> <b>ارائه‌دهنده پیش‌فرض و فعال ربات باشد</b>
     </label>
-    <button onclick="addProvider()">➕ ذخیره ارائه‌دهنده و استخراج مدل‌ها</button>
+
+    <button type="button" class="btn-primary" onclick="addProvider()">➕ ذخیره ارائه‌دهنده و استخراج خودکار مدل‌ها</button>
   </div>
 
   <div class="card">
-    <h3>🌐 ارائه‌دهندگان ثبت‌شده</h3>
-    <div id="providersList">در حال بارگذاری...</div>
+    <h3>
+      <span>🌐 ارائه‌دهندگان ثبت‌شده (<span id="provCount">0</span>)</span>
+      <button type="button" class="btn-sm btn-ghost" onclick="syncWithServer()">🔄 تازه‌سازی</button>
+    </h3>
+    <div id="providersList"></div>
   </div>
 
   <div class="card">
-    <h3>🤖 کاتالوگ مدل‌ها و تست زنده سلامت (Live Latency Test)</h3>
+    <h3>
+      <span>🤖 کاتالوگ مدل‌ها و تست سلامت زنده (Live Latency)</span>
+      <button type="button" class="btn-sm btn-green" onclick="refreshLiveModels()">🔄 استخراج مدل‌ها از API</button>
+    </h3>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;">
+      <button type="button" class="preset-btn" style="background:#064e3b;border-color:#059669;color:#a7f3d0;" onclick="setActiveModel('auto_free')">🎁 فعال‌سازی خودکار رایگان (Auto Free)</button>
+      <button type="button" class="preset-btn" style="background:#0c4a6e;border-color:#0284c7;color:#bae6fd;" onclick="setActiveModel('auto')">🤖 فعال‌سازی خودکار همه (Auto All)</button>
+    </div>
+
     <div style="display:flex;gap:6px;align-items:center;">
       <input id="modelSearch" placeholder="🔍 جستجو بین مدل‌ها..." oninput="filterModelsUI()" style="margin:0;">
-      <button class="btn-sm btn-green" style="width:auto;white-space:nowrap;" onclick="refreshLiveModels()">🔄 بروزرسانی از API</button>
+      <button type="button" class="btn-sm btn-ghost" onclick="clearModelSearch()">پاکسازی</button>
     </div>
+
     <div class="filter-nav">
-      <button class="filter-btn active" id="fBtnAll" onclick="setModelFilter('all')">همه مدل‌ها (<span id="cntAll">0</span>)</button>
-      <button class="filter-btn" id="fBtnFree" onclick="setModelFilter('free')">🎁 فقط رایگان (<span id="cntFree">0</span>)</button>
-      <button class="filter-btn" id="fBtnStd" onclick="setModelFilter('std')">💎 استاندارد (<span id="cntStd">0</span>)</button>
+      <button type="button" class="filter-btn active" id="fBtnAll" onclick="setModelFilter('all')">همه مدل‌ها (<span id="cntAll">0</span>)</button>
+      <button type="button" class="filter-btn" id="fBtnFree" onclick="setModelFilter('free')">🎁 فقط رایگان (<span id="cntFree">0</span>)</button>
+      <button type="button" class="filter-btn" id="fBtnStd" onclick="setModelFilter('std')">💎 استاندارد (<span id="cntStd">0</span>)</button>
     </div>
-    <div id="modelsContainer" class="model-table">در حال بارگذاری مدل‌ها...</div>
+
+    <div style="margin-bottom:8px;">
+      <button type="button" class="btn-sm btn-purple" style="width:100%;justify-content:center;" onclick="testAllFreeModelsThrottled()">🧪 تست سلامت دسته‌جمعی مدل‌های رایگان (ضد ۴۲۹)</button>
+    </div>
+
+    <div id="modelsContainer" class="model-table"></div>
   </div>
 </div>
 
 <!-- ==================== TAB 2: BOT & WEBHOOK ==================== -->
 <div id="tab-bot" style="display:none;">
   <div class="card">
-    <h3>🤖 وضعیت و تنظیمات ربات تلگرام</h3>
+    <h3>🤖 وضعیت و پیکربندی ربات تلگرام</h3>
+    
     <label class="lbl">توکن ربات تلگرام (Bot Token):</label>
     <div style="display:flex;gap:6px;margin-top:6px;">
       <input id="botTokenInput" type="password" dir="ltr" style="margin:0;">
-      <button class="btn-sm btn-warn" style="width:auto;white-space:nowrap;" onclick="toggleTokenView()">👁 نمایش</button>
+      <button type="button" class="btn-sm btn-ghost" onclick="toggleKeyVisibility('botTokenInput')">👁 نمایش</button>
     </div>
 
-    <label class="lbl">آیدی عددی تلگرام ادمین:</label>
+    <label class="lbl">آیدی عددی تلگرام ادمین کل:</label>
     <input id="botAdminId" dir="ltr" placeholder="123456789">
 
-    <label class="lbl">رمز عبور پنل وب (برای ورود بدون تلگرام از مرورگر):</label>
+    <label class="lbl">رمز عبور اختصاصی پنل وب (جهت ورود مستقیم بدون تلگرام):</label>
     <input id="botWebSecret" type="password" dir="ltr" placeholder="یک رمز عبور امن">
 
-    <button onclick="saveBotConfig()">💾 ذخیره تنظیمات و اتصال مجدد به وب‌هوک</button>
+    <button type="button" class="btn-primary" onclick="saveBotConfig()">💾 ذخیره تنظیمات و همگام‌سازی وب‌هوک</button>
   </div>
 
   <div class="card">
     <h3>📡 وضعیت زنده وب‌هوک تلگرام</h3>
-    <div style="font-size:12px;color:#94a3b8;line-height:1.7;">
-      <div><b>آدرس وب‌هوک:</b> <span id="whUrl" dir="ltr" style="color:#38bdf8;">-</span></div>
-      <div><b>پیام‌های در صف:</b> <span id="whPending" style="color:#4ade80;">0</span></div>
+    <div style="font-size:12px;color:var(--text-muted);line-height:1.8;background:rgba(0,0,0,0.25);padding:10px;border-radius:10px;">
+      <div><b>آدرس وب‌هوک:</b> <span id="whUrl" dir="ltr" style="color:var(--cyan);word-break:break-all;">-</span></div>
+      <div><b>پیام‌های معلق در صف:</b> <span id="whPending" style="color:#4ade80;">0</span></div>
       <div><b>آخرین خطا:</b> <span id="whError" style="color:#f87171;">ندارد</span></div>
     </div>
-    <div style="display:flex;gap:6px;margin-top:10px;">
-      <button class="btn-green" onclick="resyncWebhook()">🔄 همگام‌سازی مجدد وب‌هوک</button>
-      <button class="btn-purple" onclick="checkWebhook()">⚡ تست وضعیت وب‌هوک</button>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button type="button" class="btn-primary" style="margin:0;background:linear-gradient(135deg, #10b981, #059669);" onclick="resyncWebhook()">🔄 همگام‌سازی مجدد وب‌هوک</button>
+      <button type="button" class="btn-sm btn-purple" style="white-space:nowrap;" onclick="checkWebhook()">⚡ تست اتصال</button>
     </div>
   </div>
 </div>
@@ -2629,95 +4415,139 @@ function renderMiniAppHTML(sys, botToken, origin) {
 <!-- ==================== TAB 3: SOULS ==================== -->
 <div id="tab-souls" style="display:none;">
   <div class="card">
-    <h3>🎭 تنظیم پرامپت ۳ حالت مجزا</h3>
+    <h3>🎭 تنظیم پرامپت ۳ حالت مجزای دستیار</h3>
+    <div class="card-subtitle">می‌توانید رفتار و لحن هوش مصنوعی را در هر حالت جداگانه شخصی‌سازی کنید:</div>
+
     <label class="lbl">۱. حالت چت ساده و روزمره (/chat):</label>
     <textarea id="chatSoulInput" rows="2"></textarea>
+
     <label class="lbl">۲. حالت کارمند حرفه‌ای و برنامه‌نویس (/work):</label>
     <textarea id="workSoulInput" rows="3"></textarea>
+
     <label class="lbl">۳. حالت شخصیت سفارشی (/custom):</label>
-    <textarea id="customSoulInput" rows="4"></textarea>
-    <label class="lbl">پرامپت عمومی مهمان‌ها:</label>
+    <textarea id="customSoulInput" rows="3"></textarea>
+
+    <label class="lbl">پرامپت عمومی مهمان‌ها و کاربران عادی:</label>
     <textarea id="soulInput" rows="2"></textarea>
-    <button onclick="saveSouls()">💾 ذخیره شخصیت‌ها</button>
+
+    <button type="button" class="btn-primary" onclick="saveSouls()">💾 ذخیره شخصیت‌ها و پرامپت‌ها</button>
   </div>
 </div>
 
 <!-- ==================== TAB 4: USERS ==================== -->
 <div id="tab-users" style="display:none;">
   <div class="card">
-    <h3>⚙️ تنظیمات دسترسی عمومی</h3>
-    <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;">
-      <input type="checkbox" id="publicModeInput" style="width:auto;margin:0;"> ربات برای همه کاربران تلگرام باز باشد (Public Mode)
+    <h3>⚙️ تنظیمات دسترسی عمومی ربات</h3>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12.5px;cursor:pointer;">
+      <input type="checkbox" id="publicModeInput" style="width:auto;margin:0;"> <b>ربات برای عموم کاربران تلگرام باز باشد (Public Access)</b>
     </label>
-    <label class="lbl">سقف پیام روزانه پیش‌فرض کاربران عمومی:</label>
+    <div class="card-subtitle" style="margin-top:4px;">در صورت فعال بودن، هر کاربری می‌تواند بدون نیاز به تایید ادمین با ربات گفتگو کند.</div>
+
+    <label class="lbl">سقف پیام روزانه کاربران عمومی:</label>
     <input id="defaultLimitInput" type="number" placeholder="20">
-    <button onclick="savePublicSettings()">💾 ذخیره تنظیمات عمومی</button>
+
+    <button type="button" class="btn-primary" onclick="savePublicSettings()">💾 ذخیره تنظیمات عمومی</button>
   </div>
 
   <div class="card">
-    <h3>👥 مدیریت اعضا (Whitelist / BYOK)</h3>
-    <input id="mId" placeholder="آیدی عددی تلگرام کاربر">
-    <input id="mName" placeholder="نام کاربر">
-    <input id="mLimit" type="number" placeholder="سقف پیام روزانه (0 = نامحدود)">
-    <button onclick="addMember()">➕ افزودن عضو</button>
-    <div id="memberList" style="margin-top:10px;"></div>
+    <h3>👥 مدیریت اعضا و سهمیه‌های اختصاصی (Whitelist)</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+      <input id="mId" placeholder="آیدی عددی کاربر" style="margin-top:0;">
+      <input id="mName" placeholder="نام کاربر" style="margin-top:0;">
+    </div>
+    <input id="mLimit" type="number" placeholder="سقف پیام روزانه (0 = نامحدود)" style="margin-top:6px;">
+    <button type="button" class="btn-primary" onclick="addMember()">➕ افزودن عضو جدید</button>
+
+    <div id="memberList" style="margin-top:12px;"></div>
   </div>
 </div>
 
 <!-- ==================== TAB 5: SPONSORS ==================== -->
 <div id="tab-sponsors" style="display:none;">
   <div class="card">
-    <h3>📢 کانال‌های اسپانسری (عضویت اجباری)</h3>
-    <input id="sponsorInput" dir="ltr" placeholder="@ChannelUsername">
-    <button onclick="addSponsor()">➕ افزودن کانال اسپانسر</button>
-    <div id="sponsorList" style="margin-top:10px;"></div>
+    <h3>📢 کانال‌های عضویت اجباری (اسپانسر)</h3>
+    <div class="card-subtitle">کاربران عادی قبل از ارسال پیام ملزم به عضویت در این کانال‌ها خواهند بود:</div>
+    <div style="display:flex;gap:6px;">
+      <input id="sponsorInput" dir="ltr" placeholder="@ChannelUsername" style="margin:0;">
+      <button type="button" class="btn-sm btn-green" style="white-space:nowrap;width:auto;" onclick="addSponsor()">➕ افزودن</button>
+    </div>
+    <div id="sponsorList" style="margin-top:12px;"></div>
   </div>
 
   <div class="card">
-    <h3>⏰ کرون‌جاب و پیام خودکار</h3>
-    <input id="cronMsg" placeholder="متن پیام یادآوری...">
-    <input id="cronMins" type="number" placeholder="زمان اجرا (دقیقه دیگر)">
-    <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;">
-      <input type="checkbox" id="cronRepeat" style="width:auto;margin:0;"> تکرار خودکار
-    </label>
-    <button onclick="addCron()">➕ ثبت کرون‌جاب</button>
-    <div id="cronList" style="margin-top:10px;"></div>
+    <h3>⏰ کرون‌جاب و پیام خودکار دوره‌ای</h3>
+    <input id="cronMsg" placeholder="متن پیام خودکار...">
+    <div style="display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center;margin-top:6px;">
+      <input id="cronMins" type="number" placeholder="زمان اجرا (دقیقه دیگر)" style="margin:0;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+        <input type="checkbox" id="cronRepeat" style="width:auto;margin:0;"> تکرار خودکار
+      </label>
+    </div>
+    <button type="button" class="btn-primary" onclick="addCron()">➕ ثبت کرون‌جاب</button>
+    <div id="cronList" style="margin-top:12px;"></div>
   </div>
 </div>
 
 <!-- ==================== TAB 6: MEDIA & BRIDGE ==================== -->
 <div id="tab-media" style="display:none;">
   <div class="card">
-    <h3>📸 گالری عکس‌های ایجنت</h3>
+    <h3>📸 گالری تصاویر ایجنت</h3>
     <input id="photoLabel" placeholder="عنوان عکس">
-    <input id="photoFileId" dir="ltr" placeholder="Telegram file_id">
-    <button onclick="addPhoto()">➕ افزودن به گالری</button>
-    <div id="photoList" style="margin-top:10px;"></div>
+    <input id="photoFileId" dir="ltr" placeholder="شناسه file_id تلگرام">
+    <button type="button" class="btn-primary" onclick="addPhoto()">➕ افزودن به گالری</button>
+    <div id="photoList" style="margin-top:12px;"></div>
   </div>
 
   <div class="card">
-    <h3>🔗 سرور لینوکس (Linux Bridge)</h3>
-    <label class="lbl">آدرس سرور لینوکس:</label>
-    <input id="bridgeInput" dir="ltr" placeholder="http://IP:8080">
+    <h3>🔗 اتصال به سرور لینوکس (Linux Bridge)</h3>
+    <label class="lbl">آدرس پل لینوکس (Linux Bridge URL):</label>
+    <input id="bridgeInput" dir="ltr" placeholder="http://YOUR_SERVER_IP:8080">
     <label class="lbl">رمز امنیتی پل (Bridge Secret):</label>
-    <input id="bridgeSecretInput" dir="ltr" placeholder="یک رمز طولانی">
-    <button onclick="saveBridgeSettings()">💾 ذخیره تنظیمات لینوکس</button>
+    <input id="bridgeSecretInput" dir="ltr" placeholder="یک توکن امنیتی طولانی">
+    <button type="button" class="btn-primary" onclick="saveBridgeSettings()">💾 ذخیره تنظیمات پل لینوکس</button>
   </div>
 </div>
 
 <script>
-let currentSys = null;
-let currentFilter = 'all';
-let allRawModels = [];
-const tg = window.Telegram?.WebApp;
-if (tg) tg.expand();
+// ============================================================================
+// منطق کلاینت و رندر داده‌ها - داده‌های اولیه مستقیم و بدون تاخیر از ورکر تزریق شده‌اند
+// ============================================================================
+var initialSys = ${safeSysJson};
+var currentSys = initialSys || {};
+var currentFilter = 'all';
+var allRawModels = [];
+var tg = window.Telegram && window.Telegram.WebApp;
+if (tg) {
+  try {
+    tg.ready();
+    tg.expand();
+  } catch (e) {}
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function showToast(text, type) {
+  type = type || 'info';
+  var t = document.getElementById('toast');
+  if (!t) return;
+  t.className = 'toast toast-' + type + ' show';
+  var icon = type === 'success' ? '🟢' : type === 'error' ? '❌' : 'ℹ️';
+  t.innerHTML = '<span>' + icon + '</span> <span>' + escapeHtml(text) + '</span>';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(function() {
+    t.className = 'toast';
+  }, 3200);
+}
 
 function getAuthHeaders() {
-  const headers = { 'Content-Type': 'application/json' };
+  var headers = { 'Content-Type': 'application/json' };
   if (tg && tg.initData) {
     headers['X-Telegram-Init-Data'] = tg.initData;
   }
-  const secret = localStorage.getItem('admin_secret');
+  var secret = localStorage.getItem('admin_secret');
   if (secret) {
     headers['X-Admin-Secret'] = secret;
   }
@@ -2725,131 +4555,202 @@ function getAuthHeaders() {
 }
 
 async function api(payload) {
-  const res = await fetch('/api/admin', {
-    method: 'POST',
-    headers: getAuthHeaders(),
-    body: JSON.stringify(payload)
-  });
-  if (res.status === 403) {
-    document.getElementById('authBox').style.display = 'flex';
-    return { ok: false, error: 'UNAUTHORIZED' };
+  try {
+    var res = await fetch('/api/admin', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 403) {
+      document.getElementById('authBox').style.display = 'flex';
+      showToast('لطفاً رمز عبور پنل را وارد کنید', 'error');
+      return { ok: false, error: 'UNAUTHORIZED' };
+    }
+    return await res.json();
+  } catch (e) {
+    showToast('خطای ارتباط با سرور: ' + (e.message || 'شبکه ناموفق'), 'error');
+    return { ok: false, error: e.message };
   }
-  return res.json();
 }
 
 function doLogin() {
-  const s = document.getElementById('loginSecret').value.trim();
-  if (!s) return alert('رمز عبور را وارد کنید');
+  var s = document.getElementById('loginSecret').value.trim();
+  if (!s) return showToast('رمز عبور را وارد کنید', 'error');
   localStorage.setItem('admin_secret', s);
   document.getElementById('authBox').style.display = 'none';
-  loadDashboard();
+  syncWithServer();
 }
 
-function switchTab(tabId) {
-  ['providers', 'bot', 'souls', 'users', 'sponsors', 'media'].forEach(t => {
-    document.getElementById('tab-' + t).style.display = (t === tabId) ? 'block' : 'none';
-  });
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
+function switchTab(tabId, el) {
+  var tabs = ['providers', 'bot', 'souls', 'users', 'sponsors', 'media'];
+  for (var i = 0; i < tabs.length; i++) {
+    var t = tabs[i];
+    var pane = document.getElementById('tab-' + t);
+    if (pane) pane.style.display = (t === tabId) ? 'block' : 'none';
+  }
+  var buttons = document.querySelectorAll('.tab-btn');
+  for (var j = 0; j < buttons.length; j++) {
+    buttons[j].classList.remove('active');
+  }
+  var targetBtn = el || document.querySelector('[data-tab="' + tabId + '"]');
+  if (targetBtn) targetBtn.classList.add('active');
   if (tabId === 'bot') checkWebhook();
 }
 
+function toggleKeyVisibility(id) {
+  var inp = document.getElementById(id);
+  if (inp) inp.type = inp.type === 'password' ? 'text' : 'password';
+}
+
 function applyPreset(name) {
-  const presets = {
-    google: { name: 'Google Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', key: '' },
-    groq: { name: 'Groq Cloud', url: 'https://api.groq.com/openai/v1', key: '' },
-    openrouter: { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1', key: '' },
+  var presets = {
+    google: { name: 'Google Gemini (رایگان و پرسرعت)', url: 'https://generativelanguage.googleapis.com/v1beta/openai', key: '' },
+    groq: { name: 'Groq Cloud (فوق‌العاده سریع)', url: 'https://api.groq.com/openai/v1', key: '' },
+    openrouter: { name: 'OpenRouter (مدل‌های متنوع)', url: 'https://openrouter.ai/api/v1', key: '' },
     deepseek: { name: 'DeepSeek Official', url: 'https://api.deepseek.com/v1', key: '' },
     tokenharbor: { name: 'TokenHarbor', url: 'https://tokenharbor.ai/v1', key: '' },
-    ccr: { name: 'سرور CCR شخصی', url: 'https://my-proxy.workers.dev/v1', key: '' }
+    custom: { name: 'ارائه‌دهنده اختصاصی (Custom)', url: 'https://api.unorouter.com/v1', key: '' }
   };
-  const p = presets[name];
+  var p = presets[name];
   if (p) {
     document.getElementById('provName').value = p.name;
     document.getElementById('provUrl').value = p.url;
     document.getElementById('provKey').focus();
+    showToast('پیش‌تنظیم ' + p.name + ' اعمال شد', 'info');
   }
 }
 
 async function detectUrl() {
-  const url = document.getElementById('provUrl').value.trim();
-  const key = document.getElementById('provKey').value.trim();
-  const resBox = document.getElementById('urlDetectResult');
-  if (!url) return alert('آدرس URL را وارد کنید');
+  var url = document.getElementById('provUrl').value.trim();
+  var key = document.getElementById('provKey').value.trim();
+  var resBox = document.getElementById('urlDetectResult');
+  if (!url) return showToast('آدرس Base URL را وارد کنید', 'error');
   resBox.innerText = '⏳ در حال تست و اعتبارسنجی خودکار...';
-  const res = await api({ action: 'detect_baseurl', url, apiKey: key });
+  var res = await api({ action: 'detect_baseurl', url: url, apiKey: key });
   if (res.workingUrl) {
     document.getElementById('provUrl').value = res.workingUrl;
-    resBox.innerHTML = '✅ <b>آدرس تایید شد:</b> ' + res.workingUrl;
+    resBox.innerHTML = '🟢 <b>آدرس تایید شد:</b> ' + escapeHtml(res.workingUrl);
+    showToast('آدرس Base URL معتبر و آماده است', 'success');
   } else {
-    resBox.innerText = '⚠️ خطای اعتبارسنجی: ' + (res.error || 'نامشخص');
+    resBox.innerText = '⚠️ نتیجه: ' + (res.error || 'پاسخ نامشخص');
+    showToast('خطا در اعتبارسنجی آدرس', 'error');
   }
 }
 
 async function addProvider() {
-  const name = document.getElementById('provName').value.trim();
-  const baseUrl = document.getElementById('provUrl').value.trim();
-  const apiKey = document.getElementById('provKey').value.trim();
-  const isDefault = document.getElementById('provDefault').checked;
-  if (!baseUrl) return alert('آدرس Base URL را وارد کنید');
-  await api({ action: 'add_provider', name, baseUrl, apiKey, isDefault });
-  document.getElementById('provName').value = '';
-  document.getElementById('provUrl').value = '';
-  document.getElementById('provKey').value = '';
-  loadDashboard();
+  var name = document.getElementById('provName').value.trim();
+  var baseUrl = document.getElementById('provUrl').value.trim();
+  var apiKey = document.getElementById('provKey').value.trim();
+  var isDefault = document.getElementById('provDefault').checked;
+  if (!baseUrl) return showToast('آدرس Base URL را وارد کنید', 'error');
+
+  showToast('در حال ثبت ارائه‌دهنده و استخراج مدل‌ها...', 'info');
+  var res = await api({ action: 'add_provider', name: name, baseUrl: baseUrl, apiKey: apiKey, isDefault: isDefault });
+  if (res.ok !== false) {
+    showToast('ارائه‌دهنده با موفقیت ذخیره شد', 'success');
+    document.getElementById('provName').value = '';
+    document.getElementById('provUrl').value = '';
+    document.getElementById('provKey').value = '';
+    document.getElementById('urlDetectResult').innerText = '';
+    await syncWithServer();
+  }
 }
 
 async function setActiveProvider(id) {
-  await api({ action: 'set_active_provider', providerId: id });
-  loadDashboard();
+  showToast('در حال تغییر ارائه‌دهنده فعال...', 'info');
+  var res = await api({ action: 'set_active_provider', providerId: id });
+  if (res.ok !== false) {
+    showToast('ارائه‌دهنده فعال با موفقیت تغییر کرد', 'success');
+    await syncWithServer();
+  }
 }
 
 async function deleteProvider(id) {
-  if (confirm('این ارائه‌دهنده حذف شود؟')) {
-    await api({ action: 'delete_provider', providerId: id });
-    loadDashboard();
+  if (confirm('آیا از حذف این ارائه‌دهنده اطمینان دارید؟')) {
+    var res = await api({ action: 'delete_provider', providerId: id });
+    if (res.ok !== false) {
+      showToast('ارائه‌دهنده حذف شد', 'info');
+      await syncWithServer();
+    }
   }
 }
 
 async function testProviderPing(baseUrl, apiKey) {
-  alert('در حال تست پینگ...');
-  const res = await api({ action: 'detect_baseurl', url: baseUrl, apiKey });
-  if (res.success) {
-    alert('🟢 ارتباط موفق! کد وضعیت: ' + res.status);
+  showToast('در حال تست پینگ و سلامت سرور...', 'info');
+  var res = await api({ action: 'detect_baseurl', url: baseUrl, apiKey: apiKey });
+  if (res.success || res.workingUrl) {
+    showToast('🟢 ارتباط با سرور برقرار است (کد: ' + (res.status || '200 OK') + ')', 'success');
   } else {
-    alert('❌ خطا در پینگ: ' + (res.error || 'ناموفق'));
+    showToast('❌ خطا در پینگ سرور: ' + (res.error || 'عدم پاسخ'), 'error');
   }
 }
 
-async function testSingleModel(modelId, baseUrl, apiKey, btnId) {
-  const btn = document.getElementById(btnId);
-  const badge = document.getElementById('lat_' + modelId.replace(/[^a-zA-Z0-9]/g, '_'));
+async function testSingleModel(modelId, baseUrl, apiKey) {
+  var safeId = modelId.replace(/[^a-zA-Z0-9]/g, '_');
+  var badge = document.getElementById('lat_' + safeId);
   if (badge) badge.innerHTML = '<span class="latency-tag" style="background:#0284c7;color:#fff;">⏳ تست...</span>';
-  const res = await api({ action: 'test_model', model: modelId, baseUrl, apiKey });
+
+  var res = await api({ action: 'test_model', model: modelId, baseUrl: baseUrl, apiKey: apiKey });
   if (res.ok) {
-    if (badge) badge.innerHTML = '<span class="latency-tag" style="background:#064e3b;color:#4ade80;">🟢 ' + res.latencyMs + 'ms</span>';
+    var ms = res.latencyMs || 0;
+    var bg = ms < 2000 ? '#064e3b' : ms < 5000 ? '#78350f' : '#7f1d1d';
+    var clr = ms < 2000 ? '#4ade80' : ms < 5000 ? '#fde047' : '#fca5a5';
+    if (badge) badge.innerHTML = '<span class="latency-tag" style="background:' + bg + ';color:' + clr + ';">🟢 ' + ms + 'ms</span>';
+    showToast('مدل ' + modelId + ' سالم است (تاخیر: ' + ms + 'ms)', 'success');
   } else {
     if (badge) badge.innerHTML = '<span class="latency-tag" style="background:#7f1d1d;color:#fca5a5;">❌ خطا</span>';
-    alert('خطای تست مدل: ' + (res.error || 'نامشخص'));
+    showToast('خطای تست مدل: ' + (res.error || 'کد وضعیت ناموفق'), 'error');
   }
+}
+
+async function testAllFreeModelsThrottled() {
+  var freeModels = allRawModels.filter(function(m) { return m.isFree; });
+  if (freeModels.length === 0) return showToast('هیچ مدل رایگانی در کاتالوگ یافت نشد', 'info');
+
+  var activeProv = (currentSys && currentSys.providers || []).find(function(p) { return p.isDefault; }) || (currentSys && currentSys.providers && currentSys.providers[0]) || {};
+  showToast('تست پینگ ' + Math.min(freeModels.length, 10) + ' مدل رایگان با تاخیر محافظتی آغاز شد...', 'info');
+
+  for (var i = 0; i < Math.min(freeModels.length, 10); i++) {
+    var m = freeModels[i];
+    await testSingleModel(m.id, activeProv.baseUrl || '', activeProv.apiKey || '');
+    await new Promise(function(r) { setTimeout(r, 700); });
+  }
+  showToast('تست نمونه مدل‌های رایگان به پایان رسید', 'success');
 }
 
 async function setActiveModel(m) {
-  await api({ action: 'set_active_model', model: m });
-  alert('مدل فعال ربات تنظیم شد به: ' + m);
-  loadDashboard();
+  var res = await api({ action: 'set_active_model', model: m });
+  if (res.ok !== false) {
+    if (currentSys) currentSys.selectedModel = m;
+    var badge = document.getElementById('headerActiveModel');
+    if (badge) {
+      badge.innerText = 'مدل: ' + (m === 'auto_free' ? '🎁 خودکار رایگان' : m === 'auto' ? '🤖 خودکار همه' : m);
+    }
+    showToast('مدل فعال ربات تنظیم شد: ' + m, 'success');
+    renderModelCatalog();
+  }
 }
 
 async function refreshLiveModels() {
-  document.getElementById('modelsContainer').innerHTML = '⏳ در حال دریافت لیست مدل‌ها از API...';
-  const res = await api({ action: 'refresh_models' });
-  loadDashboard(res.discoveryError);
+  var cont = document.getElementById('modelsContainer');
+  if (cont) cont.innerHTML = '<div class="empty-state">⏳ در حال ارتباط با سرور و استخراج مدل‌ها...</div>';
+  showToast('در حال دریافت زنده مدل‌ها از API ارائه‌دهنده...', 'info');
+
+  var res = await api({ action: 'refresh_models' });
+  if (res.ok !== false) {
+    showToast('مدل‌ها با موفقیت بروزرسانی شدند', 'success');
+    await syncWithServer();
+  }
 }
 
 function setModelFilter(f) {
   currentFilter = f;
-  ['All', 'Free', 'Std'].forEach(k => document.getElementById('fBtn' + k).classList.remove('active'));
-  document.getElementById('fBtn' + (f === 'all' ? 'All' : (f === 'free' ? 'Free' : 'Std'))).classList.add('active');
+  ['All', 'Free', 'Std'].forEach(function(k) {
+    var b = document.getElementById('fBtn' + k);
+    if (b) b.classList.remove('active');
+  });
+  var activeBtn = document.getElementById('fBtn' + (f === 'all' ? 'All' : (f === 'free' ? 'Free' : 'Std')));
+  if (activeBtn) activeBtn.classList.add('active');
   renderModelCatalog();
 }
 
@@ -2857,49 +4758,261 @@ function filterModelsUI() {
   renderModelCatalog();
 }
 
-function renderModelCatalog() {
-  const cont = document.getElementById('modelsContainer');
-  const query = (document.getElementById('modelSearch').value || '').toLowerCase().trim();
-  const activeProv = (currentSys?.providers || []).find(p => p.isDefault) || currentSys?.providers?.[0] || {};
+function clearModelSearch() {
+  var s = document.getElementById('modelSearch');
+  if (s) {
+    s.value = '';
+    renderModelCatalog();
+  }
+}
 
-  let filtered = allRawModels;
-  if (currentFilter === 'free') filtered = filtered.filter(m => m.isFree);
-  if (currentFilter === 'std') filtered = filtered.filter(m => !m.isFree);
-  if (query) filtered = filtered.filter(m => m.id.toLowerCase().includes(query));
+function renderProviders() {
+  var pList = document.getElementById('providersList');
+  if (!pList) return;
+  var providers = currentSys.providers || [];
+  var cntElem = document.getElementById('provCount');
+  if (cntElem) cntElem.innerText = providers.length;
 
-  if (filtered.length === 0) {
-    cont.innerHTML = '<div style="color:#94a3b8;padding:12px;text-align:center;">هیچ مدلی یافت نشد.</div>';
+  if (providers.length === 0) {
+    pList.innerHTML = '<div class="empty-state">هیچ ارائه‌دهنده‌ای ثبت نشده است. از فرم بالا اولین ارائه‌دهنده را اضافه کنید.</div>';
     return;
   }
 
-  let html = '';
-  filtered.forEach(m => {
-    const isSelected = currentSys?.selectedModel === m.id;
-    const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
-    const badgeHtml = m.isFree
-      ? '<span class="badge-free">🎁 ' + (m.tag || 'رایگان') + '</span>'
+  var html = '';
+  for (var i = 0; i < providers.length; i++) {
+    var p = providers[i];
+    var isAct = Boolean(p.isDefault);
+    var maskedKey = p.apiKey ? (p.apiKey.slice(0, 5) + '••••' + p.apiKey.slice(-4)) : 'بدون کلید';
+    var activeBadge = isAct
+      ? '<span class="badge-pill badge-success">🟢 پیش‌فرض ربات</span>'
+      : '<span class="badge-pill badge-neutral">⚪ ذخیره‌شده</span>';
+
+    html += '<div class="provider-card ' + (isAct ? 'active-prov' : '') + '">';
+    html += '<div class="provider-header">';
+    html += '<div><b>' + escapeHtml(p.name) + '</b> ' + activeBadge + '</div>';
+    html += '<div style="display:flex;gap:4px;">';
+    if (!isAct) {
+      html += '<button type="button" class="btn-sm btn-green btn-prov-activate" data-id="' + escapeHtml(p.id) + '">⭐ فعال‌سازی</button>';
+    }
+    html += '<button type="button" class="btn-sm btn-red btn-prov-delete" data-id="' + escapeHtml(p.id) + '">حذف</button>';
+    html += '</div></div>';
+    html += '<div class="prov-details">' + escapeHtml(p.baseUrl) + ' | ' + escapeHtml(maskedKey) + '</div>';
+    html += '<div style="display:flex;gap:6px;margin-top:8px;">';
+    html += '<button type="button" class="btn-sm btn-purple btn-prov-ping" data-id="' + escapeHtml(p.id) + '">⚡ تست پینگ</button>';
+    html += '</div></div>';
+  }
+  pList.innerHTML = html;
+}
+
+function renderModelCatalog() {
+  var cont = document.getElementById('modelsContainer');
+  if (!cont) return;
+  var searchInput = document.getElementById('modelSearch');
+  var query = (searchInput ? searchInput.value : '').toLowerCase().trim();
+
+  var filtered = allRawModels;
+  if (currentFilter === 'free') {
+    filtered = filtered.filter(function(m) { return m.isFree; });
+  } else if (currentFilter === 'std') {
+    filtered = filtered.filter(function(m) { return !m.isFree; });
+  }
+  if (query) {
+    filtered = filtered.filter(function(m) { return m.id.toLowerCase().indexOf(query) >= 0; });
+  }
+
+  if (filtered.length === 0) {
+    cont.innerHTML = '<div class="empty-state">هیچ مدلی با فیلتر انتخابی یافت نشد.</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < filtered.length; i++) {
+    var m = filtered[i];
+    var isSelected = currentSys && currentSys.selectedModel === m.id;
+    var safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
+    var badgeHtml = m.isFree
+      ? '<span class="badge-free">🎁 رایگان</span>'
       : '<span class="badge-std">💎 استاندارد</span>';
 
-    html += `
-      <div class="model-item">
-        <div>
-          <b>${isSelected ? '🟢 ' : ''}<span dir="ltr">${m.id}</span></b>
-          <div style="margin-top:3px;">${badgeHtml} <span id="lat_${safeId}"></span></div>
-        </div>
-        <div style="display:flex;gap:4px;">
-          <button id="btn_test_${safeId}" class="btn-sm btn-purple" onclick="testSingleModel('${m.id}', '${activeProv.baseUrl || ''}', '${activeProv.apiKey || ''}', 'btn_test_${safeId}')">🧪 تست پینگ</button>
-          <button class="btn-sm btn-green" onclick="setActiveModel('${m.id}')">⭐ انتخاب</button>
-        </div>
-      </div>
-    `;
-  });
+    html += '<div class="model-item ' + (isSelected ? 'selected-model' : '') + '">';
+    html += '<div>';
+    html += '<div class="model-name">' + (isSelected ? '⭐ ' : '') + escapeHtml(m.id) + '</div>';
+    html += '<div style="display:flex;align-items:center;gap:6px;margin-top:4px;">';
+    html += badgeHtml;
+    if (isSelected) {
+      html += '<span class="badge-pill badge-primary" style="font-size:10px;padding:1px 6px;">فعال در ربات</span>';
+    }
+    html += '<span id="lat_' + safeId + '"></span>';
+    html += '</div></div>';
+    html += '<div style="display:flex;gap:4px;">';
+    html += '<button type="button" class="btn-sm btn-purple btn-model-test" data-model="' + escapeHtml(m.id) + '">🧪 تست</button>';
+    html += '<button type="button" class="btn-sm btn-green btn-model-select" data-model="' + escapeHtml(m.id) + '">⭐ انتخاب</button>';
+    html += '</div></div>';
+  }
   cont.innerHTML = html;
 }
 
+function renderMembers() {
+  var mList = document.getElementById('memberList');
+  if (!mList) return;
+  var members = currentSys.members || {};
+  var entries = Object.entries(members);
+  if (entries.length === 0) {
+    mList.innerHTML = '<div class="empty-state">هیچ عضو اختصاصی ثبت نشده است.</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < entries.length; i++) {
+    var id = entries[i][0];
+    var m = entries[i][1];
+    var byok = m.customApiKey ? ' 🔑' : '';
+    var banStatus = m.blocked ? ' <span style="color:#f87171;">🚫 مسدود</span>' : ' <span style="color:#4ade80;">🟢 فعال</span>';
+    html += '<div class="item-row">';
+    html += '<span><b>' + escapeHtml(m.name || 'کاربر') + '</b> (' + escapeHtml(id) + ')' + byok + ' | پیام‌ها: ' + (m.totalMessages || 0) + ' (' + banStatus + ')</span>';
+    html += '<div style="display:flex;gap:4px;">';
+    html += '<button type="button" class="btn-sm btn-warn btn-member-ban" data-id="' + escapeHtml(id) + '">' + (m.blocked ? 'آن‌بن' : 'بن') + '</button>';
+    html += '<button type="button" class="btn-sm btn-red btn-member-del" data-id="' + escapeHtml(id) + '">حذف</button>';
+    html += '</div></div>';
+  }
+  mList.innerHTML = html;
+}
+
+function renderSponsors() {
+  var sList = document.getElementById('sponsorList');
+  if (!sList) return;
+  var channels = currentSys.sponsorChannels || [];
+  if (channels.length === 0) {
+    sList.innerHTML = '<div class="empty-state">کانال اسپانسری تعریف نشده است.</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < channels.length; i++) {
+    var ch = channels[i];
+    html += '<div class="item-row"><span dir="ltr" style="font-weight:600;color:var(--cyan);">' + escapeHtml(ch) + '</span><button type="button" class="btn-sm btn-red btn-sponsor-del" data-channel="' + escapeHtml(ch) + '">حذف</button></div>';
+  }
+  sList.innerHTML = html;
+}
+
+function renderCrons() {
+  var cList = document.getElementById('cronList');
+  if (!cList) return;
+  var crons = (currentSys.crons || []).filter(function(c) { return c.active; });
+  if (crons.length === 0) {
+    cList.innerHTML = '<div class="empty-state">کرون‌جابی ثبت نشده است.</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < crons.length; i++) {
+    var c = crons[i];
+    html += '<div class="item-row"><span>⏰ ' + escapeHtml(c.message) + '</span><button type="button" class="btn-sm btn-red btn-cron-del" data-id="' + escapeHtml(c.id) + '">حذف</button></div>';
+  }
+  cList.innerHTML = html;
+}
+
+function renderPhotos() {
+  var phoList = document.getElementById('photoList');
+  if (!phoList) return;
+  var photos = currentSys.photoGallery || [];
+  if (photos.length === 0) {
+    phoList.innerHTML = '<div class="empty-state">عکسی در گالری موجود نیست.</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < photos.length; i++) {
+    var p = photos[i];
+    html += '<div class="item-row"><span>🖼 <b>' + escapeHtml(p.label) + '</b></span><button type="button" class="btn-sm btn-red btn-photo-del" data-id="' + escapeHtml(p.id) + '">حذف</button></div>';
+  }
+  phoList.innerHTML = html;
+}
+
+function renderAllUI() {
+  if (!currentSys) return;
+
+  var botBadge = document.getElementById('headerBotUser');
+  if (botBadge) {
+    botBadge.innerText = currentSys.botToken ? 'ربات: متصل' : 'ربات: متصل نیست';
+    botBadge.className = 'badge-pill ' + (currentSys.botToken ? 'badge-success' : 'badge-neutral');
+  }
+
+  var modelBadge = document.getElementById('headerActiveModel');
+  if (modelBadge) {
+    var sel = currentSys.selectedModel || 'auto';
+    modelBadge.innerText = 'مدل: ' + (sel === 'auto_free' ? '🎁 خودکار رایگان' : sel === 'auto' ? '🤖 خودکار همه' : sel);
+  }
+
+  var activeProv = (currentSys.providers || []).find(function(p) { return p.isDefault; }) || (currentSys.providers && currentSys.providers[0]);
+  var provBadge = document.getElementById('headerActiveProv');
+  if (provBadge) {
+    provBadge.innerText = 'سرور: ' + (activeProv ? activeProv.name : 'تنظیم نشده');
+  }
+
+  var tokenInp = document.getElementById('botTokenInput');
+  if (tokenInp) tokenInp.value = currentSys.botToken || '';
+  var adminInp = document.getElementById('botAdminId');
+  if (adminInp) adminInp.value = currentSys.adminId || '';
+  var secInp = document.getElementById('botWebSecret');
+  if (secInp) secInp.value = currentSys.webSecret || '';
+
+  var cSoul = document.getElementById('chatSoulInput');
+  if (cSoul) cSoul.value = currentSys.chatSoul || '';
+  var wSoul = document.getElementById('workSoulInput');
+  if (wSoul) wSoul.value = currentSys.workSoul || '';
+  var cuSoul = document.getElementById('customSoulInput');
+  if (cuSoul) cuSoul.value = currentSys.customSoul || '';
+  var gSoul = document.getElementById('soulInput');
+  if (gSoul) gSoul.value = currentSys.soul || '';
+
+  var pubInp = document.getElementById('publicModeInput');
+  if (pubInp) pubInp.checked = Boolean(currentSys.publicMode);
+  var defLim = document.getElementById('defaultLimitInput');
+  if (defLim) defLim.value = currentSys.defaultDailyLimit || 20;
+
+  var brInp = document.getElementById('bridgeInput');
+  if (brInp) brInp.value = currentSys.linuxBridgeUrl || '';
+  var brSec = document.getElementById('bridgeSecretInput');
+  if (brSec) brSec.value = currentSys.bridgeSecret || '';
+
+  renderProviders();
+
+  var cached = currentSys.cachedModels || [];
+  var freeCached = currentSys.cachedFreeModels || [];
+  allRawModels = cached.map(function(id) {
+    return { id: id, isFree: freeCached.indexOf(id) >= 0 };
+  });
+
+  var cAll = document.getElementById('cntAll');
+  if (cAll) cAll.innerText = allRawModels.length;
+  var cFree = document.getElementById('cntFree');
+  if (cFree) cFree.innerText = allRawModels.filter(function(m) { return m.isFree; }).length;
+  var cStd = document.getElementById('cntStd');
+  if (cStd) cStd.innerText = allRawModels.filter(function(m) { return !m.isFree; }).length;
+
+  renderModelCatalog();
+  renderMembers();
+  renderSponsors();
+  renderCrons();
+  renderPhotos();
+}
+
+async function syncWithServer() {
+  try {
+    var res = await fetch('/api/admin', { headers: getAuthHeaders() });
+    if (res.status === 403) {
+      document.getElementById('authBox').style.display = 'flex';
+      return;
+    }
+    var data = await res.json();
+    if (data.ok && data.sys) {
+      currentSys = data.sys;
+      renderAllUI();
+    }
+  } catch (e) {}
+}
+
 async function checkWebhook() {
-  const res = await api({ action: 'check_webhook' });
-  if (res.result?.result) {
-    const r = res.result.result;
+  var res = await api({ action: 'check_webhook' });
+  if (res.result && res.result.result) {
+    var r = res.result.result;
     document.getElementById('whUrl').innerText = r.url || 'ثبت نشده';
     document.getElementById('whPending').innerText = r.pending_update_count || 0;
     document.getElementById('whError').innerText = r.last_error_message || 'ندارد';
@@ -2907,175 +5020,274 @@ async function checkWebhook() {
 }
 
 async function resyncWebhook() {
-  const res = await api({ action: 'resync_webhook' });
-  alert(res.ok ? '✅ وب‌هوک با موفقیت همگام‌سازی شد' : '❌ خطا در تنظیم وب‌هوک');
+  showToast('در حال همگام‌سازی وب‌هوک با سرور تلگرام...', 'info');
+  var res = await api({ action: 'resync_webhook' });
+  if (res.ok) {
+    showToast('وب‌هوک با موفقیت همگام‌سازی شد', 'success');
+  } else {
+    showToast('خطا در تنظیم وب‌هوک', 'error');
+  }
   checkWebhook();
 }
 
-function toggleTokenView() {
-  const inp = document.getElementById('botTokenInput');
-  inp.type = inp.type === 'password' ? 'text' : 'password';
-}
-
 async function saveBotConfig() {
-  const token = document.getElementById('botTokenInput').value.trim();
-  const adminId = document.getElementById('botAdminId').value.trim();
-  const webSecret = document.getElementById('botWebSecret').value.trim();
-  const res = await api({ action: 'update_bot_config', botToken: token, adminId, webSecret });
-  if (res.ok) {
+  var token = document.getElementById('botTokenInput').value.trim();
+  var adminId = document.getElementById('botAdminId').value.trim();
+  var webSecret = document.getElementById('botWebSecret').value.trim();
+  showToast('در حال ذخیره تنظیمات ربات...', 'info');
+  var res = await api({ action: 'update_bot_config', botToken: token, adminId: adminId, webSecret: webSecret });
+  if (res.ok !== false) {
     if (webSecret) localStorage.setItem('admin_secret', webSecret);
-    alert('تنظیمات ربات و وب‌هوک ذخیره شد');
-    loadDashboard();
-  } else {
-    alert('خطا: ' + (res.error || 'نامشخص'));
+    showToast('تنظیمات ربات ذخیره و متصل شد', 'success');
+    await syncWithServer();
   }
 }
 
 async function saveSouls() {
-  await api({
+  showToast('در حال ذخیره پرامپت‌ها...', 'info');
+  var res = await api({
     action: 'update_settings',
     chatSoul: document.getElementById('chatSoulInput').value,
     workSoul: document.getElementById('workSoulInput').value,
     customSoul: document.getElementById('customSoulInput').value,
     soul: document.getElementById('soulInput').value
   });
-  alert('هر ۳ شخصیت با موفقیت ذخیره شدند');
+  if (res.ok !== false) {
+    showToast('تمامی شخصیت‌ها با موفقیت ذخیره شدند', 'success');
+  }
 }
 
 async function savePublicSettings() {
-  await api({
+  showToast('در حال ذخیره تنظیمات دسترسی عمومی...', 'info');
+  var res = await api({
     action: 'update_settings',
     publicMode: document.getElementById('publicModeInput').checked,
     defaultDailyLimit: document.getElementById('defaultLimitInput').value
   });
-  alert('تنظیمات دسترسی عمومی ذخیره شد');
+  if (res.ok !== false) {
+    showToast('تنظیمات دسترسی عمومی ذخیره شد', 'success');
+  }
 }
 
 async function addMember() {
-  await api({ action: 'add_member', userId: document.getElementById('mId').value, name: document.getElementById('mName').value, limit: document.getElementById('mLimit').value });
-  loadDashboard();
-}
-async function toggleBan(uId) { await api({ action: 'toggle_ban', userId: uId }); loadDashboard(); }
-async function delMember(uId) { await api({ action: 'remove_member', userId: uId }); loadDashboard(); }
-async function addSponsor() { await api({ action: 'add_sponsor', channel: document.getElementById('sponsorInput').value }); document.getElementById('sponsorInput').value = ''; loadDashboard(); }
-async function delSponsor(ch) { await api({ action: 'delete_sponsor', channel: ch }); loadDashboard(); }
-async function addCron() { await api({ action: 'add_cron', message: document.getElementById('cronMsg').value, minutes: document.getElementById('cronMins').value, repeat: document.getElementById('cronRepeat').checked }); document.getElementById('cronMsg').value = ''; loadDashboard(); }
-async function delCron(id) { await api({ action: 'delete_cron', id }); loadDashboard(); }
-async function addPhoto() { await api({ action: 'add_photo', fileId: document.getElementById('photoFileId').value, label: document.getElementById('photoLabel').value }); document.getElementById('photoFileId').value = ''; loadDashboard(); }
-async function delPhoto(id) { await api({ action: 'delete_photo', id }); loadDashboard(); }
-async function saveBridgeSettings() {
-  await api({ action: 'update_settings', linuxBridgeUrl: document.getElementById('bridgeInput').value, bridgeSecret: document.getElementById('bridgeSecretInput').value });
-  alert('تنظیمات پل لینوکس ذخیره شد');
+  var uId = document.getElementById('mId').value.trim();
+  var name = document.getElementById('mName').value.trim();
+  var limit = document.getElementById('mLimit').value.trim();
+  if (!uId) return showToast('آیدی کاربر را وارد کنید', 'error');
+  await api({ action: 'add_member', userId: uId, name: name, limit: limit });
+  document.getElementById('mId').value = '';
+  document.getElementById('mName').value = '';
+  document.getElementById('mLimit').value = '';
+  showToast('عضو افزوده شد', 'success');
+  await syncWithServer();
 }
 
-async function loadDashboard(extraError) {
-  const res = await fetch('/api/admin', { headers: getAuthHeaders() });
-  if (res.status === 403) {
-    document.getElementById('authBox').style.display = 'flex';
+async function toggleBan(uId) {
+  await api({ action: 'toggle_ban', userId: uId });
+  await syncWithServer();
+}
+
+async function delMember(uId) {
+  if (confirm('کاربر حذف شود؟')) {
+    await api({ action: 'remove_member', userId: uId });
+    await syncWithServer();
+  }
+}
+
+async function addSponsor() {
+  var ch = document.getElementById('sponsorInput').value.trim();
+  if (!ch) return showToast('آیدی کانال را وارد کنید', 'error');
+  await api({ action: 'add_sponsor', channel: ch });
+  document.getElementById('sponsorInput').value = '';
+  showToast('کانال اسپانسر ذخیره شد', 'success');
+  await syncWithServer();
+}
+
+async function delSponsor(ch) {
+  if (confirm('حذف کانال اسپانسر؟')) {
+    await api({ action: 'delete_sponsor', channel: ch });
+    await syncWithServer();
+  }
+}
+
+async function addCron() {
+  var msg = document.getElementById('cronMsg').value.trim();
+  var mins = document.getElementById('cronMins').value.trim();
+  var repeat = document.getElementById('cronRepeat').checked;
+  if (!msg) return showToast('متن پیام را وارد کنید', 'error');
+  await api({ action: 'add_cron', message: msg, minutes: mins, repeat: repeat });
+  document.getElementById('cronMsg').value = '';
+  showToast('کرون‌جاب ثبت شد', 'success');
+  await syncWithServer();
+}
+
+async function delCron(id) {
+  await api({ action: 'delete_cron', id: id });
+  await syncWithServer();
+}
+
+async function addPhoto() {
+  var fileId = document.getElementById('photoFileId').value.trim();
+  var label = document.getElementById('photoLabel').value.trim();
+  if (!fileId) return showToast('شناسه file_id را وارد کنید', 'error');
+  await api({ action: 'add_photo', fileId: fileId, label: label });
+  document.getElementById('photoFileId').value = '';
+  document.getElementById('photoLabel').value = '';
+  showToast('عکس افزوده شد', 'success');
+  await syncWithServer();
+}
+
+async function delPhoto(id) {
+  await api({ action: 'delete_photo', id: id });
+  await syncWithServer();
+}
+
+async function saveBridgeSettings() {
+  await api({
+    action: 'update_settings',
+    linuxBridgeUrl: document.getElementById('bridgeInput').value,
+    bridgeSecret: document.getElementById('bridgeSecretInput').value
+  });
+  showToast('تنظیمات پل لینوکس ذخیره شد', 'success');
+}
+
+// گوش‌دادن مرکزی به کلیک‌ها (Event Delegation)
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('button');
+  if (!btn) return;
+
+  if (btn.classList.contains('tab-btn')) {
+    var tabId = btn.getAttribute('data-tab');
+    if (tabId) switchTab(tabId, btn);
     return;
   }
-  const data = await res.json();
-  currentSys = data.sys;
-
-  document.getElementById('headerBotUser').innerText = currentSys.botToken ? 'ربات: متصل' : 'ربات: متصل نیست';
-  document.getElementById('headerActiveModel').innerText = 'مدل: ' + (currentSys.selectedModel || 'auto');
-
-  document.getElementById('botTokenInput').value = currentSys.botToken || '';
-  document.getElementById('botAdminId').value = currentSys.adminId || '';
-  document.getElementById('botWebSecret').value = currentSys.webSecret || '';
-
-  document.getElementById('chatSoulInput').value = currentSys.chatSoul || '';
-  document.getElementById('workSoulInput').value = currentSys.workSoul || '';
-  document.getElementById('customSoulInput').value = currentSys.customSoul || '';
-  document.getElementById('soulInput').value = currentSys.soul || '';
-
-  document.getElementById('publicModeInput').checked = Boolean(currentSys.publicMode);
-  document.getElementById('defaultLimitInput').value = currentSys.defaultDailyLimit || 20;
-
-  document.getElementById('bridgeInput').value = currentSys.linuxBridgeUrl || '';
-  document.getElementById('bridgeSecretInput').value = currentSys.bridgeSecret || '';
-
-  // Providers list
-  const pList = document.getElementById('providersList');
-  pList.innerHTML = '';
-  (currentSys.providers || []).forEach(p => {
-    const isAct = p.isDefault;
-    const maskedKey = p.apiKey ? (p.apiKey.slice(0, 5) + '...' + p.apiKey.slice(-4)) : 'بدون کلید';
-    pList.innerHTML += `
-      <div class="provider-card">
-        <div class="provider-header">
-          <div><b>${isAct ? '🟢 ' : '⚪ '}${p.name}</b> <span class="badge-tag">${isAct ? 'پیش‌فرض ربات' : 'غیرفعال'}</span></div>
-          <div style="display:flex;gap:4px;">
-            ${!isAct ? `<button class="btn-sm btn-green" onclick="setActiveProvider('${p.id}')">⭐ فعال‌سازی</button>` : ''}
-            <button class="btn-sm btn-red" onclick="deleteProvider('${p.id}')">حذف</button>
-          </div>
-        </div>
-        <div style="font-size:11px;color:#94a3b8;font-family:monospace;direction:ltr;text-align:left;">${p.baseUrl} | ${maskedKey}</div>
-        <div style="display:flex;gap:4px;margin-top:8px;">
-          <button class="btn-sm btn-purple" onclick="testProviderPing('${p.baseUrl}', '${p.apiKey}')">⚡ تست پینگ</button>
-        </div>
-      </div>
-    `;
-  });
-
-  // Models catalog
-  const cached = currentSys.cachedModels || [];
-  const freeCached = currentSys.cachedFreeModels || [];
-  allRawModels = cached.map(id => ({ id, isFree: freeCached.includes(id), tag: freeCached.includes(id) ? 'رایگان' : 'استاندارد' }));
-  document.getElementById('cntAll').innerText = allRawModels.length;
-  document.getElementById('cntFree').innerText = allRawModels.filter(m => m.isFree).length;
-  document.getElementById('cntStd').innerText = allRawModels.filter(m => !m.isFree).length;
-  renderModelCatalog();
-
-  // Whitelist members
-  const mList = document.getElementById('memberList');
-  mList.innerHTML = '';
-  for (const [id, m] of Object.entries(currentSys.members || {})) {
-    const byok = m.customApiKey ? ' 🔑' : '';
-    const banStatus = m.blocked ? ' 🚫 مسدود' : ' 🟢 فعال';
-    mList.innerHTML += `
-      <div class="item-row">
-        <span><b>${m.name}</b> (${id})${byok} | پیام: ${m.totalMessages || 0} (${banStatus})</span>
-        <div style="display:flex;gap:4px;">
-          <button class="btn-sm btn-warn" onclick="toggleBan('${id}')">${m.blocked ? 'آن‌بن' : 'بن'}</button>
-          <button class="btn-sm btn-red" onclick="delMember('${id}')">حذف</button>
-        </div>
-      </div>
-    `;
+  if (btn.classList.contains('btn-prov-activate')) {
+    setActiveProvider(btn.getAttribute('data-id'));
+    return;
   }
+  if (btn.classList.contains('btn-prov-delete')) {
+    deleteProvider(btn.getAttribute('data-id'));
+    return;
+  }
+  if (btn.classList.contains('btn-prov-ping')) {
+    var provId = btn.getAttribute('data-id');
+    var p = (currentSys && currentSys.providers || []).find(function(x) { return x.id === provId; });
+    if (p) testProviderPing(p.baseUrl, p.apiKey || '');
+    return;
+  }
+  if (btn.classList.contains('btn-model-test')) {
+    var modelId = btn.getAttribute('data-model');
+    var activeProv = (currentSys && currentSys.providers || []).find(function(x) { return x.isDefault; }) || (currentSys && currentSys.providers && currentSys.providers[0]) || {};
+    testSingleModel(modelId, activeProv.baseUrl || '', activeProv.apiKey || '');
+    return;
+  }
+  if (btn.classList.contains('btn-model-select')) {
+    setActiveModel(btn.getAttribute('data-model'));
+    return;
+  }
+  if (btn.classList.contains('btn-member-ban')) {
+    toggleBan(btn.getAttribute('data-id'));
+    return;
+  }
+  if (btn.classList.contains('btn-member-del')) {
+    delMember(btn.getAttribute('data-id'));
+    return;
+  }
+  if (btn.classList.contains('btn-sponsor-del')) {
+    delSponsor(btn.getAttribute('data-channel'));
+    return;
+  }
+  if (btn.classList.contains('btn-cron-del')) {
+    delCron(btn.getAttribute('data-id'));
+    return;
+  }
+  if (btn.classList.contains('btn-photo-del')) {
+    delPhoto(btn.getAttribute('data-id'));
+    return;
+  }
+});
 
-  // Sponsors
-  const sList = document.getElementById('sponsorList');
-  sList.innerHTML = '';
-  (currentSys.sponsorChannels || []).forEach(ch => {
-    sList.innerHTML += `<div class="item-row"><span dir="ltr">${ch}</span><button class="btn-sm btn-red" onclick="delSponsor('${ch}')">حذف</button></div>`;
-  });
+// اجرای اولیه رندر
+try {
+  renderAllUI();
+} catch (err) {
+  console.error("renderAllUI error:", err);
+}
 
-  // Crons
-  const cList = document.getElementById('cronList');
-  cList.innerHTML = '';
-  (currentSys.crons || []).filter(c => c.active).forEach(c => {
-    cList.innerHTML += `<div class="item-row"><span>⏰ ${c.message}</span><button class="btn-sm btn-red" onclick="delCron('${c.id}')">حذف</button></div>`;
-  });
-
-  // Gallery
-  const phoList = document.getElementById('photoList');
-  phoList.innerHTML = '';
-  (currentSys.photoGallery || []).forEach(p => {
-    phoList.innerHTML += `<div class="item-row"><span>🖼 <b>${p.label}</b></span><button class="btn-sm btn-red" onclick="delPhoto('${p.id}')">حذف</button></div>`;
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function() {
+    try { renderAllUI(); } catch (e) {}
   });
 }
 
-loadDashboard();
+// همگام‌سازی پس‌زمینه با سرور
+syncWithServer();
 </script>
 </body>
 </html>`;
 }
 
 
+function splitTelegramChunks(text, maxChunkLen = 3800) {
+  if (!text || text.length <= maxChunkLen) return [text || ""];
+  const chunks = [];
+  let current = "";
+  let inCode = false;
+  let codeLang = "";
+
+  const lines = text.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const willExceed = (current.length + line.length + 1) > maxChunkLen;
+
+    if (willExceed && current) {
+      if (inCode) {
+        current += "\n```";
+        chunks.push(current);
+        current = "```" + codeLang + "\n" + line;
+      } else {
+        chunks.push(current);
+        current = line;
+      }
+    } else {
+      if (current) {
+        current += "\n" + line;
+      } else {
+        current = line;
+      }
+    }
+
+    if (trimmed.startsWith("```")) {
+      if (!inCode) {
+        inCode = true;
+        codeLang = trimmed.slice(3).trim();
+      } else {
+        inCode = false;
+        codeLang = "";
+      }
+    }
+  }
+
+  if (current) {
+    chunks.push(current);
+  }
+
+  const safeChunks = [];
+  for (const c of chunks) {
+    if (c.length <= 3950) {
+      safeChunks.push(c);
+    } else {
+      const sub = c.match(/[\s\S]{1,3900}/g) || [c];
+      safeChunks.push(...sub);
+    }
+  }
+
+  return safeChunks.length > 0 ? safeChunks : [text];
+}
+
 async function sendTelegramMessage(botToken, chatId, text, inlineKeyboard = []) {
   if (!text || !text.trim()) text = "⚠️ [پاسخ خالی از مدل]";
-  const chunks = text.match(/[\s\S]{1,3900}/g) || [text];
+  const chunks = splitTelegramChunks(text, 3800);
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
     const body = { chat_id: chatId, text: chunks[i], parse_mode: "Markdown" };
